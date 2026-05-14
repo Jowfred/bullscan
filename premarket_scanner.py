@@ -12,12 +12,17 @@ Run:          python premarket_scanner.py
 """
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import threading
 import queue
 import re
 import os
+import sys
 import json
+import shutil
+import hashlib
+import tempfile
+import subprocess
 import logging
 import webbrowser
 from datetime import datetime, timezone, timedelta
@@ -43,6 +48,11 @@ REFRESH_INTERVAL_SEC = 300
 MAX_STORIES = 80  # cards rendered at once; lower = smoother window resize
 USER_AGENT = "Mozilla/5.0 (PremarketScanner/1.0)"
 HTTP_TIMEOUT = 15
+
+# ─── Auto-updater ─────────────────────────────────────────────────────────────
+UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
+APP_VERSION = "2.1.0"
+UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
     "Reuters": [
@@ -275,6 +285,116 @@ def is_premarket_now():
     start = now_et.replace(hour=4, minute=0, second=0, microsecond=0)
     end = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     return start <= now_et <= end
+
+# ───────────────────────────── AUTO-UPDATER ───────────────────────────────────
+
+def _local_script_path():
+    """Path to the running script file."""
+    try:
+        return os.path.abspath(__file__)
+    except NameError:
+        return os.path.abspath(sys.argv[0])
+
+def _sha256(data_bytes):
+    return hashlib.sha256(data_bytes).hexdigest()
+
+def fetch_remote_script():
+    """Fetch the remote script. Returns bytes, or raises."""
+    req = Request(UPDATE_URL, headers={"User-Agent": USER_AGENT, "Cache-Control": "no-cache"})
+    with urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        return resp.read()
+
+def check_for_update():
+    """
+    Check GitHub for a newer version of the script.
+    Returns dict: {'available': bool, 'remote_bytes': bytes|None, 'reason': str}
+    """
+    try:
+        local_path = _local_script_path()
+        if not os.path.exists(local_path):
+            return {"available": False, "remote_bytes": None,
+                    "reason": "Local script path not found."}
+
+        with open(local_path, "rb") as f:
+            local_bytes = f.read()
+
+        remote_bytes = fetch_remote_script()
+
+        # Basic sanity: refuse to install anything that isn't a Python script
+        head = remote_bytes[:200].decode("utf-8", errors="ignore")
+        if "tkinter" not in remote_bytes[:8000].decode("utf-8", errors="ignore") \
+                and "PreMarketScanner" not in remote_bytes[:20000].decode("utf-8", errors="ignore"):
+            return {"available": False, "remote_bytes": None,
+                    "reason": "Remote content doesn't look like the scanner script."}
+
+        if _sha256(local_bytes) == _sha256(remote_bytes):
+            return {"available": False, "remote_bytes": None,
+                    "reason": "Already up to date."}
+
+        return {"available": True, "remote_bytes": remote_bytes, "reason": "Update available."}
+
+    except (HTTPError, URLError) as e:
+        return {"available": False, "remote_bytes": None,
+                "reason": f"Couldn't reach update server: {e}"}
+    except Exception as e:
+        LOGGER.exception("Update check failed")
+        return {"available": False, "remote_bytes": None,
+                "reason": f"Update check error: {e}"}
+
+def apply_update(remote_bytes):
+    """
+    Write the remote script to the local path (backing up the old one).
+    Returns the local path on success, or raises.
+    """
+    local_path = _local_script_path()
+    backup_path = local_path + ".bak"
+
+    # Validate it parses as Python first — never write garbage
+    try:
+        compile(remote_bytes, "<remote-update>", "exec")
+    except SyntaxError as e:
+        raise RuntimeError(f"Downloaded update has a syntax error: {e}")
+
+    # Back up current file
+    try:
+        shutil.copy2(local_path, backup_path)
+    except Exception as e:
+        LOGGER.warning(f"Couldn't create backup: {e}")
+
+    # Write atomically: temp file in same dir, then replace
+    target_dir = os.path.dirname(local_path)
+    fd, tmp_path = tempfile.mkstemp(prefix=".update_", suffix=".py", dir=target_dir)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(remote_bytes)
+        os.replace(tmp_path, local_path)
+    except Exception:
+        try: os.remove(tmp_path)
+        except Exception: pass
+        raise
+
+    LOGGER.info(f"Updated script at {local_path} (backup at {backup_path})")
+    return local_path
+
+def restart_app():
+    """Relaunch the script in a new process and exit the current one."""
+    script_path = _local_script_path()
+    python_exe = sys.executable or "python"
+    try:
+        # On Windows, DETACHED_PROCESS isn't needed if we just use Popen + exit
+        subprocess.Popen([python_exe, script_path],
+                         close_fds=True,
+                         cwd=os.path.dirname(script_path) or None)
+    except Exception as e:
+        LOGGER.exception("Failed to restart")
+        messagebox.showerror(
+            "Restart failed",
+            f"Update installed, but couldn't auto-restart.\n\n"
+            f"Please close this window and re-open the app manually.\n\nError: {e}"
+        )
+        return
+    # Exit current process
+    os._exit(0)
 
 # ───────────────────────────── TICKER EXTRACTION ──────────────────────────────
 
@@ -911,6 +1031,10 @@ class PreMarketScanner(tk.Tk):
         self._tick_clock()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Check for updates on launch (non-blocking, won't notify unless update found)
+        if UPDATE_CHECK_ON_LAUNCH:
+            self.after(2500, self._silent_update_check_on_launch)
+
     def _load_settings(self):
         if not os.path.exists(SETTINGS_FILE):
             return
@@ -982,6 +1106,9 @@ class PreMarketScanner(tk.Tk):
         tk.Label(footer, text=f"  Logging: {LOG_FILE}",
                  bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
                  font=(FONT_DISPLAY, 8)).pack(side="left", padx=12, pady=6)
+        tk.Label(footer, text=f"v{APP_VERSION}  ·  ",
+                 bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
+                 font=(FONT_DISPLAY, 8)).pack(side="right", padx=0, pady=6)
         self.count_lbl = tk.Label(footer, text="0 stories",
                                   bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
                                   font=(FONT_DISPLAY, 8))
@@ -1081,6 +1208,15 @@ class PreMarketScanner(tk.Tk):
                 font=(FONT_DISPLAY, 9), anchor="w",
                 command=self._on_category_change
                 ).pack(side="left", anchor="w")
+
+        # Updater section
+        self._section_header(side, "APP UPDATES")
+        self.update_btn = tk.Button(side, text="⤓  CHECK FOR UPDATES",
+            bg=PALETTE["panel"], fg=PALETTE["accent"],
+            font=(FONT_DISPLAY, 9, "bold"), bd=0, relief="flat",
+            activebackground=PALETTE["panel_hover"], cursor="hand2",
+            command=self._manual_update_check, padx=10, pady=8)
+        self.update_btn.pack(fill="x", padx=18, pady=(0, 16))
 
     def _section_header(self, parent, text):
         tk.Frame(parent, bg=PALETTE["border"], height=1).pack(fill="x", padx=14, pady=(18, 8))
@@ -1375,6 +1511,69 @@ class PreMarketScanner(tk.Tk):
         self._save_settings()
         LOGGER.info("Scanner closed.")
         self.destroy()
+
+    # ─────────── Auto-updater ───────────
+    def _silent_update_check_on_launch(self):
+        """Background check on launch. Doesn't bother user if no update."""
+        def worker():
+            result = check_for_update()
+            self.after(0, lambda: self._handle_update_result(result, silent=True))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _manual_update_check(self):
+        """Triggered by the sidebar button — always shows a result."""
+        self.update_btn.config(state="disabled", text="Checking…")
+        def worker():
+            result = check_for_update()
+            self.after(0, lambda: self._handle_update_result(result, silent=False))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_update_result(self, result, silent):
+        try: self.update_btn.config(state="normal", text="⤓  CHECK FOR UPDATES")
+        except Exception: pass
+
+        if result["available"]:
+            remote_bytes = result["remote_bytes"]
+            kb = len(remote_bytes) // 1024
+            answer = messagebox.askyesno(
+                "Update Available",
+                f"A new version of Bull Scanner is available "
+                f"({kb} KB).\n\n"
+                f"Install now? The app will back up your current version "
+                f"and restart automatically.",
+                parent=self,
+            )
+            if answer:
+                self._install_update(remote_bytes)
+            return
+
+        # No update available — only show message if user asked
+        if not silent:
+            messagebox.showinfo("No Updates",
+                f"{result.get('reason', 'You are running the latest version.')}\n\n"
+                f"Current version: v{APP_VERSION}",
+                parent=self)
+        else:
+            LOGGER.info(f"Launch update check: {result.get('reason', 'no update')}")
+
+    def _install_update(self, remote_bytes):
+        try:
+            local_path = apply_update(remote_bytes)
+        except Exception as e:
+            messagebox.showerror("Update Failed",
+                f"Couldn't install the update:\n\n{e}\n\n"
+                f"Your current version is unchanged.",
+                parent=self)
+            return
+
+        messagebox.showinfo("Update Installed",
+            f"Update installed successfully.\n\n"
+            f"The app will restart now.\n\n"
+            f"(Old version backed up to: {os.path.basename(local_path)}.bak)",
+            parent=self)
+        self._save_settings()
+        LOGGER.info("Update installed; restarting.")
+        restart_app()
 
 
 def main():
