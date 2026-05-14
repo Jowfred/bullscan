@@ -64,10 +64,6 @@ RSS_FEEDS = {
     ],
     "Yahoo Finance": [
         "https://finance.yahoo.com/news/rssindex",
-    ],
-    "Stock Titan": [
-        "https://www.stocktitan.net/news/",
-    ]
 }
 
 CATALYST_KEYWORDS = {
