@@ -51,7 +51,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -747,14 +747,12 @@ class StoryDetailWindow(tk.Toplevel):
         # Tickers & research links
         if s.get("tickers"):
             self._section(body, "TICKERS DETECTED")
-            tk_wrap = tk.Frame(body, bg=PALETTE["bg"])
-            tk_wrap.pack(fill="x", padx=24, pady=(0, 6))
             for t in s["tickers"][:6]:
-                self._ticker_chip(tk_wrap, t)
+                self._ticker_card(body, t)
 
             note = tk.Label(body,
-                text="Click any link beside a ticker — Chart (TradingView), Yahoo Finance, Finviz, "
-                     "or SEC filings. Always verify the ticker matches the company described.",
+                text="Each ticker has a TradingView chart and quick research links. "
+                     "Always verify the ticker matches the company in the headline.",
                 bg=PALETTE["bg"], fg=PALETTE["text_mute"],
                 font=(FONT_DISPLAY, 8), anchor="w", justify="left", wraplength=700)
             note.pack(fill="x", padx=24, pady=(4, 16))
@@ -848,27 +846,53 @@ class StoryDetailWindow(tk.Toplevel):
                  fg=PALETTE["text_dim"], font=(FONT_DISPLAY, 9, "bold")
                  ).pack(side="left")
 
-    def _ticker_chip(self, parent, ticker):
-        chip = tk.Frame(parent, bg=PALETTE["highlight"], cursor="hand2")
-        chip.pack(side="left", padx=(0, 8), pady=2)
+    def _ticker_card(self, parent, ticker):
+        """Full-width card per ticker with prominent TradingView CTA and research links."""
+        card = tk.Frame(parent, bg=PALETTE["panel"],
+                        highlightthickness=1, highlightbackground=PALETTE["border"])
+        card.pack(fill="x", padx=24, pady=(0, 8))
 
-        tk.Label(chip, text=f"${ticker}", bg=PALETTE["highlight"],
-                 fg=PALETTE["text"], font=(FONT_DISPLAY, 11, "bold"),
-                 padx=10, pady=4).pack(side="left")
+        # Left column: big ticker symbol
+        left = tk.Frame(card, bg=PALETTE["highlight"], width=90)
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
+        tk.Label(left, text=f"${ticker}", bg=PALETTE["highlight"],
+                 fg=PALETTE["text"], font=(FONT_DISPLAY, 16, "bold")
+                 ).pack(expand=True, padx=8, pady=14)
 
-        # Research links menu inline
-        links = tk.Frame(chip, bg=PALETTE["highlight"])
-        links.pack(side="left", padx=(0, 8))
+        # Right column: TradingView CTA on top, links underneath
+        right = tk.Frame(card, bg=PALETTE["panel"])
+        right.pack(side="left", fill="both", expand=True, padx=14, pady=10)
+
+        # Primary action — TradingView
+        tv_url = f"https://www.tradingview.com/symbols/{quote_plus(ticker)}/"
+        tv_btn = tk.Button(right,
+            text=f"📈   OPEN ${ticker} CHART ON TRADINGVIEW",
+            bg=PALETTE["accent_2"], fg="#0a0e1c",
+            font=(FONT_DISPLAY, 10, "bold"),
+            bd=0, relief="flat", cursor="hand2",
+            activebackground="#34d399",
+            command=lambda u=tv_url: webbrowser.open(u),
+            padx=10, pady=8, anchor="w")
+        tv_btn.pack(fill="x")
+
+        # Secondary research row
+        sec_row = tk.Frame(right, bg=PALETTE["panel"])
+        sec_row.pack(fill="x", pady=(8, 0))
+        tk.Label(sec_row, text="Research:", bg=PALETTE["panel"],
+                 fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 8)
+                 ).pack(side="left", padx=(0, 6))
         for label, url in [
-            ("Chart", f"https://www.tradingview.com/symbols/{quote_plus(ticker)}/"),
-            ("Yahoo", f"https://finance.yahoo.com/quote/{quote_plus(ticker)}"),
+            ("Yahoo Finance", f"https://finance.yahoo.com/quote/{quote_plus(ticker)}"),
             ("Finviz", f"https://finviz.com/quote.ashx?t={quote_plus(ticker)}"),
-            ("SEC", f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={quote_plus(ticker)}&type=&dateb=&owner=include&count=40"),
+            ("SEC Filings", f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={quote_plus(ticker)}&type=&dateb=&owner=include&count=40"),
+            ("Google News", f"https://news.google.com/search?q={quote_plus(ticker)}+stock"),
         ]:
-            b = tk.Label(links, text=label, bg=PALETTE["highlight"],
-                         fg=PALETTE["accent_hi"], font=(FONT_DISPLAY, 8, "underline"),
+            b = tk.Label(sec_row, text=f"  {label}  ",
+                         bg=PALETTE["panel_alt"], fg=PALETTE["accent_hi"],
+                         font=(FONT_DISPLAY, 8, "bold"),
                          cursor="hand2", padx=4, pady=4)
-            b.pack(side="left")
+            b.pack(side="left", padx=(0, 4))
             b.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
 
 
