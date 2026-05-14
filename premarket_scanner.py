@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""
-Pre-Market Bullish News Scanner — v2
-=====================================
-A desktop app that pulls headlines from free RSS feeds (Reuters, MarketWatch,
-Benzinga, Globe Newswire, SEC EDGAR press releases, Yahoo Finance), scores them
-0-100 for bullish conviction, tags catalysts, extracts tickers, and auto-refreshes
-every 5 minutes during pre-market hours (4:00 AM - 9:30 AM ET).
 
-Dependencies: tkinter (stdlib), tzdata (pip install tzdata) on Windows.
-Run:          python premarket_scanner.py
-"""
 
 import tkinter as tk
 from tkinter import ttk, messagebox
