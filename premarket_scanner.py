@@ -51,7 +51,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
