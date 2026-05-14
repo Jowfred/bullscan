@@ -2,10 +2,7 @@
 setlocal enabledelayedexpansion
 title Bull Scanner — Installer
 
-REM ─── Bull Scanner Installer ───────────────────────────────────────────────
-REM Downloads the latest scanner from GitHub, sets up dependencies,
-REM generates a green money-sign icon, and creates a Desktop shortcut.
-REM ──────────────────────────────────────────────────────────────────────────
+
 
 echo.
 echo ============================================================
