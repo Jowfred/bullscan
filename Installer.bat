@@ -173,9 +173,9 @@ REM Remove old .vbs launcher and old shortcuts so we don't have duplicates
 if exist "%OLD_LAUNCHER%" del "%OLD_LAUNCHER%" >nul 2>&1
 if exist "%SHORTCUT_PATH%" del "%SHORTCUT_PATH%" >nul 2>&1
 
-REM Create a real .lnk shortcut that points DIRECTLY at pythonw.exe with the script as an argument.
-REM This is what makes the taskbar work correctly: Windows sees the actual Python process,
-REM and "Pin to taskbar" works as expected.
+REM Create the shortcut. The script itself sets its AppUserModelID at runtime
+REM and enforces a single-instance lock, so taskbar grouping and "no duplicate
+REM window when clicking the pinned icon" both work without any registry magic.
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$s = New-Object -ComObject WScript.Shell; $sc = $s.CreateShortcut('%SHORTCUT_PATH%'); $sc.TargetPath = '!PYTHONW!'; $sc.Arguments = '\"%SCRIPT_PATH%\"'; $sc.WorkingDirectory = '%INSTALL_DIR%'; if (Test-Path '%ICON_PATH%') { $sc.IconLocation = '%ICON_PATH%' }; $sc.Description = 'Pre-Market Bullish News Scanner'; $sc.WindowStyle = 1; $sc.Save()"
 
