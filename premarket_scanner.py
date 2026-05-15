@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -644,14 +644,36 @@ def apply_update(remote_bytes):
     return local_path
 
 def restart_app():
-    """Relaunch the script in a new process and exit the current one."""
+    """Relaunch the script in a new process and exit the current one.
+    Uses pythonw on Windows so no console flashes, and delays slightly so the
+    single-instance socket releases before the new copy tries to claim it."""
     script_path = _local_script_path()
     python_exe = sys.executable or "python"
+
+    # Prefer pythonw.exe on Windows (no console window flash on restart)
+    if sys.platform == "win32" and python_exe.lower().endswith("python.exe"):
+        pythonw_candidate = python_exe[:-len("python.exe")] + "pythonw.exe"
+        if os.path.exists(pythonw_candidate):
+            python_exe = pythonw_candidate
+
     try:
-        # On Windows, DETACHED_PROCESS isn't needed if we just use Popen + exit
-        subprocess.Popen([python_exe, script_path],
-                         close_fds=True,
-                         cwd=os.path.dirname(script_path) or None)
+        # Small delay before the new instance starts, so our socket fully releases.
+        # On Windows, use 'cmd /c start /b' with a sleep, or just rely on a Python helper.
+        if sys.platform == "win32":
+            # Use 'cmd /c' with PING for delay (built-in, reliable, no extra deps)
+            # ping -n 2 127.0.0.1 ≈ 1 second delay
+            subprocess.Popen(
+                f'cmd /c ping -n 2 127.0.0.1 >nul && start "" "{python_exe}" "{script_path}"',
+                shell=True,
+                cwd=os.path.dirname(script_path) or None,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        else:
+            subprocess.Popen(
+                ["sh", "-c", f'sleep 1 && "{python_exe}" "{script_path}"'],
+                close_fds=True,
+                cwd=os.path.dirname(script_path) or None,
+            )
     except Exception as e:
         LOGGER.exception("Failed to restart")
         messagebox.showerror(
@@ -660,7 +682,9 @@ def restart_app():
             f"Please close this window and re-open the app manually.\n\nError: {e}"
         )
         return
-    # Exit current process
+
+    # Exit current process so the new one can claim the single-instance lock
+    LOGGER.info("Exiting to allow restart...")
     os._exit(0)
 
 # ───────────────────────────── TICKER EXTRACTION ──────────────────────────────
@@ -2634,9 +2658,103 @@ class PreMarketScanner(tk.Tk):
         restart_app()
 
 
+# ─── Single-instance / taskbar integration ────────────────────────────────────
+
+APP_USER_MODEL_ID = "Anthropic.BullScanner.2"
+SINGLE_INSTANCE_PORT = 50847  # arbitrary, just for the local lock socket
+
+def _set_windows_app_id():
+    """Tell Windows this process is the same 'app' as the pinned shortcut.
+    Without this, the taskbar treats each pythonw.exe as a separate app."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception as e:
+        LOGGER.debug(f"Couldn't set AppUserModelID: {e}")
+
+def _acquire_single_instance_lock():
+    """Bind a localhost socket as a lock. If already bound, another instance
+    is running — signal it to come to front and exit. Returns the socket
+    on success (caller must keep it alive); None if another instance was
+    handling things and we should exit."""
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    try:
+        sock.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
+        sock.listen(1)
+        return sock
+    except OSError:
+        # Another instance has the lock; tell it to focus its window
+        try:
+            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client.settimeout(1.0)
+            client.connect(("127.0.0.1", SINGLE_INSTANCE_PORT))
+            client.sendall(b"FOCUS\n")
+            client.close()
+        except Exception as e:
+            LOGGER.debug(f"Couldn't signal existing instance: {e}")
+        return None
+
+def _start_focus_listener(sock, app):
+    """Background thread: accept connections from later instances and
+    bring the main window to the foreground."""
+    import socket as _socket
+    def listener():
+        while True:
+            try:
+                conn, _ = sock.accept()
+                try:
+                    conn.recv(64)
+                except Exception:
+                    pass
+                conn.close()
+                # Schedule UI focus on the main thread
+                try:
+                    app.after(0, lambda: _bring_to_front(app))
+                except Exception:
+                    pass
+            except OSError:
+                return  # socket closed during shutdown
+            except Exception as e:
+                LOGGER.debug(f"Focus listener error: {e}")
+                return
+    t = threading.Thread(target=listener, daemon=True)
+    t.start()
+
+def _bring_to_front(app):
+    """Bring the app's main window to the foreground."""
+    try:
+        app.deiconify()
+        app.lift()
+        # On Windows, attributes('-topmost', True) then back to False reliably
+        # forces it to the front without keeping it always-on-top.
+        app.attributes("-topmost", True)
+        app.after(100, lambda: app.attributes("-topmost", False))
+        app.focus_force()
+    except Exception as e:
+        LOGGER.debug(f"Bring-to-front failed: {e}")
+
 def main():
     LOGGER.info("Pre-Market Scanner starting up.")
+
+    # Windows: declare AppUserModelID before any window is created, so the
+    # taskbar groups us with our pinned shortcut.
+    _set_windows_app_id()
+
+    # Single-instance: if another copy is running, signal it and exit.
+    instance_sock = _acquire_single_instance_lock()
+    if instance_sock is None:
+        LOGGER.info("Another instance is already running; brought it to front and exiting.")
+        return
+
     app = PreMarketScanner()
+
+    # Start the listener that wakes the window when a second launch is attempted
+    _start_focus_listener(instance_sock, app)
+
     style = ttk.Style(app)
     try:
         style.theme_use("clam")
