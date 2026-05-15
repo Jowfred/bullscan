@@ -3,8 +3,7 @@ setlocal enabledelayedexpansion
 title Bull Scanner — Installer
 
 REM ──────────────────────────────────────────────────────────────────────────
-REM  BULL SCANNER INSTALLER (robust version)
-REM  Tries multiple download methods, shows errors, never closes silently.
+REM  BULL SCANNER INSTALLER (v2 — taskbar-friendly)
 REM ──────────────────────────────────────────────────────────────────────────
 
 echo.
@@ -12,14 +11,14 @@ echo ============================================================
 echo    BULL SCANNER -- INSTALLER
 echo ============================================================
 echo.
-echo  This will download and install the Pre-Market Bull Scanner
-echo  to your user folder, and put an icon on your Desktop.
+echo  This will install the Pre-Market Bull Scanner to your
+echo  user folder, generate a green money-sign icon, and put
+echo  a Desktop shortcut you can pin to the taskbar.
 echo.
 echo ============================================================
 echo.
 pause
 
-REM ─── Settings ─────────────────────────────────────────────────────────────
 set "GITHUB_USER=jowfred"
 set "GITHUB_REPO=bullscan"
 set "GITHUB_BRANCH=main"
@@ -27,10 +26,12 @@ set "GITHUB_RAW=https://raw.githubusercontent.com/%GITHUB_USER%/%GITHUB_REPO%/%G
 
 set "INSTALL_DIR=%USERPROFILE%\BullScanner"
 set "SCRIPT_PATH=%INSTALL_DIR%\premarket_scanner.py"
-set "LAUNCHER_PATH=%INSTALL_DIR%\BullScanner.vbs"
 set "ICON_PATH=%INSTALL_DIR%\bullscanner.ico"
 set "ICON_BUILDER=%INSTALL_DIR%\_make_icon.py"
 set "SHORTCUT_PATH=%USERPROFILE%\Desktop\Bull Scanner.lnk"
+
+REM Clean up the old .vbs launcher if it exists from a previous install
+set "OLD_LAUNCHER=%INSTALL_DIR%\BullScanner.vbs"
 
 REM ─── Step 1: Python check ─────────────────────────────────────────────────
 echo.
@@ -39,7 +40,7 @@ where python >nul 2>&1
 if errorlevel 1 (
     echo.
     echo  ERROR: Python is not on your PATH.
-    echo  Install Python 3.9 or newer from https://www.python.org/downloads/
+    echo  Install Python 3.9+ from https://www.python.org/downloads/
     echo  Make sure to check "Add Python to PATH" during install.
     echo.
     pause
@@ -47,35 +48,45 @@ if errorlevel 1 (
 )
 for /f "tokens=*" %%v in ('python --version 2^>^&1') do echo     Found: %%v
 
+REM Locate pythonw.exe (the GUI version of Python, no console window)
+for /f "tokens=*" %%p in ('where pythonw 2^>nul') do (
+    set "PYTHONW=%%p"
+    goto :pythonw_found
+)
+echo.
+echo  WARNING: pythonw.exe not found. Falling back to python.exe (will show console window).
+for /f "tokens=*" %%p in ('where python 2^>nul') do (
+    set "PYTHONW=%%p"
+    goto :pythonw_found
+)
+echo  ERROR: Couldn't locate Python executable.
+pause
+exit /b 1
+:pythonw_found
+echo     Using launcher: !PYTHONW!
+
 REM ─── Step 2: pip packages ─────────────────────────────────────────────────
 echo.
 echo [2/5] Installing Python packages (tzdata, Pillow)...
 python -m pip install --quiet --disable-pip-version-check tzdata Pillow
 if errorlevel 1 (
-    echo  WARNING: Package install reported an error. Trying again with output:
     python -m pip install tzdata Pillow
     if errorlevel 1 (
-        echo.
         echo  ERROR: Couldn't install required packages.
-        echo  Try running this from an admin Command Prompt, or run manually:
-        echo      python -m pip install tzdata Pillow
-        echo.
         pause
         exit /b 1
     )
 )
 echo     Done.
 
-REM ─── Step 3: Make install dir ─────────────────────────────────────────────
+REM ─── Step 3: Download script ──────────────────────────────────────────────
 echo.
 echo [3/5] Downloading scanner from GitHub...
 echo     Source: %GITHUB_RAW%
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
-
-REM Delete any leftover from a failed previous run
 if exist "%SCRIPT_PATH%" del "%SCRIPT_PATH%" >nul 2>&1
 
-REM ─── Try Method A: curl (built into Windows 10 1803+ and Windows 11) ──────
+REM Try curl first
 echo     Trying curl...
 where curl >nul 2>&1
 if not errorlevel 1 (
@@ -86,34 +97,22 @@ if not errorlevel 1 (
     echo     curl not available, trying PowerShell...
 )
 
-REM ─── Try Method B: PowerShell (force TLS 1.2, bypass execution policy) ────
+REM PowerShell fallback
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$ErrorActionPreference='Stop'; try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadFile('%GITHUB_RAW%', '%SCRIPT_PATH%') } catch { Write-Host ('     PS error: ' + $_.Exception.Message); exit 1 }"
 if exist "%SCRIPT_PATH%" goto :download_ok
 
-REM ─── Try Method C: Python (we know it's installed at this point) ──────────
+REM Python fallback
 echo     PowerShell failed, trying Python...
-python -c "import urllib.request, ssl; urllib.request.urlretrieve('%GITHUB_RAW%', r'%SCRIPT_PATH%')"
+python -c "import urllib.request; urllib.request.urlretrieve('%GITHUB_RAW%', r'%SCRIPT_PATH%')"
 if exist "%SCRIPT_PATH%" goto :download_ok
 
-REM ─── All methods failed ───────────────────────────────────────────────────
 echo.
 echo ============================================================
 echo  ERROR: All download methods failed.
 echo ============================================================
-echo.
-echo  Possible causes:
-echo    - No internet connection
-echo    - Antivirus blocking downloads
-echo    - Corporate firewall blocking GitHub
-echo    - The GitHub repo URL is wrong or private
-echo.
-echo  Manual test: Paste this URL into your browser:
-echo    %GITHUB_RAW%
-echo.
-echo  If you see Python code in the browser, the URL is fine,
-echo  and your antivirus is probably blocking the download.
-echo  If you see "404", the file isn't at that URL.
+echo  Test the URL in your browser: %GITHUB_RAW%
+echo  If you see code there, your antivirus is likely blocking.
 echo.
 pause
 exit /b 1
@@ -166,22 +165,25 @@ if errorlevel 1 (
 )
 if exist "%ICON_BUILDER%" del "%ICON_BUILDER%" >nul 2>&1
 
-REM ─── Step 5: Launcher and shortcut ────────────────────────────────────────
+REM ─── Step 5: Create shortcut pointing DIRECTLY at pythonw ─────────────────
 echo.
-echo [5/5] Creating launcher and Desktop shortcut...
+echo [5/5] Creating Desktop shortcut...
 
-> "%LAUNCHER_PATH%" echo Set WshShell = CreateObject("WScript.Shell")
->> "%LAUNCHER_PATH%" echo WshShell.CurrentDirectory = "%INSTALL_DIR%"
->> "%LAUNCHER_PATH%" echo WshShell.Run "pythonw """ ^& "%SCRIPT_PATH%" ^& """", 0, False
+REM Remove old .vbs launcher and old shortcuts so we don't have duplicates
+if exist "%OLD_LAUNCHER%" del "%OLD_LAUNCHER%" >nul 2>&1
+if exist "%SHORTCUT_PATH%" del "%SHORTCUT_PATH%" >nul 2>&1
 
+REM Create a real .lnk shortcut that points DIRECTLY at pythonw.exe with the script as an argument.
+REM This is what makes the taskbar work correctly: Windows sees the actual Python process,
+REM and "Pin to taskbar" works as expected.
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$s = New-Object -ComObject WScript.Shell; $sc = $s.CreateShortcut('%SHORTCUT_PATH%'); $sc.TargetPath = '%LAUNCHER_PATH%'; $sc.WorkingDirectory = '%INSTALL_DIR%'; if (Test-Path '%ICON_PATH%') { $sc.IconLocation = '%ICON_PATH%' }; $sc.Description = 'Pre-Market Bullish News Scanner'; $sc.Save()"
+    "$s = New-Object -ComObject WScript.Shell; $sc = $s.CreateShortcut('%SHORTCUT_PATH%'); $sc.TargetPath = '!PYTHONW!'; $sc.Arguments = '\"%SCRIPT_PATH%\"'; $sc.WorkingDirectory = '%INSTALL_DIR%'; if (Test-Path '%ICON_PATH%') { $sc.IconLocation = '%ICON_PATH%' }; $sc.Description = 'Pre-Market Bullish News Scanner'; $sc.WindowStyle = 1; $sc.Save()"
 
 if exist "%SHORTCUT_PATH%" (
     echo     Desktop shortcut created.
 ) else (
-    echo  WARNING: Shortcut creation may have failed.
-    echo  You can still launch with: %LAUNCHER_PATH%
+    echo  WARNING: Shortcut creation failed.
+    echo  You can launch manually: !PYTHONW! "%SCRIPT_PATH%"
 )
 
 echo.
@@ -190,13 +192,14 @@ echo    INSTALLATION COMPLETE
 echo ============================================================
 echo.
 echo  Installed to:     %INSTALL_DIR%
-echo  Desktop shortcut: "Bull Scanner"
+echo  Desktop shortcut: "Bull Scanner" (green $ icon)
 echo.
-echo  Look for the green $ icon on your Desktop.
-echo  Double-click it to launch.
+echo  TO PIN TO TASKBAR:
+echo    1. Double-click the Desktop icon to launch the app
+echo    2. Right-click its taskbar icon while it's running
+echo    3. Click "Pin to taskbar"
 echo.
-echo  To pin: right-click the Desktop icon, then
-echo          "Pin to taskbar" or "Pin to Start".
+echo  This time the taskbar icon will actually open the app.
 echo.
 echo ============================================================
 echo.
