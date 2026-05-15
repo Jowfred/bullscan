@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.7.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -679,6 +679,396 @@ TICKER_BLACKLIST = {
     "MON","TUE","WED","THU","FRI","SAT","SUN","ICYMI",
 }
 
+# ─── Company name → ticker dictionary ────────────────────────────────────────
+# A curated list of major US public companies. Keys are lowercase name variants
+# you'd see in a headline; values are the canonical ticker. Common short forms
+# included (e.g. "apple" → AAPL, even though the full name is "Apple Inc.")
+COMPANY_TO_TICKER = {
+    # Mega-cap tech
+    "apple": "AAPL", "apple inc": "AAPL",
+    "microsoft": "MSFT", "microsoft corp": "MSFT",
+    "alphabet": "GOOGL", "google": "GOOGL",
+    "amazon": "AMZN", "amazon.com": "AMZN",
+    "nvidia": "NVDA",
+    "meta": "META", "meta platforms": "META", "facebook": "META",
+    "tesla": "TSLA",
+    "netflix": "NFLX",
+    "broadcom": "AVGO",
+    "oracle": "ORCL",
+    "salesforce": "CRM",
+    "adobe": "ADBE",
+    "intel": "INTC",
+    "amd": "AMD", "advanced micro devices": "AMD",
+    "qualcomm": "QCOM",
+    "ibm": "IBM",
+    "cisco": "CSCO",
+    "palantir": "PLTR",
+    "snowflake": "SNOW",
+    "servicenow": "NOW",
+    "shopify": "SHOP",
+    "uber": "UBER",
+    "lyft": "LYFT",
+    "airbnb": "ABNB",
+    "doordash": "DASH",
+    "spotify": "SPOT",
+    "paypal": "PYPL",
+    "block": "SQ", "square": "SQ",
+    "coinbase": "COIN",
+    "robinhood": "HOOD",
+    "roblox": "RBLX",
+    "snap": "SNAP", "snapchat": "SNAP",
+    "pinterest": "PINS",
+    "reddit": "RDDT",
+    "twilio": "TWLO",
+    "cloudflare": "NET",
+    "datadog": "DDOG",
+    "zoom": "ZM",
+    "okta": "OKTA",
+    "crowdstrike": "CRWD",
+    "palo alto networks": "PANW",
+    "fortinet": "FTNT",
+    "zscaler": "ZS",
+    "atlassian": "TEAM",
+    "asml": "ASML",
+    "tsmc": "TSM", "taiwan semiconductor": "TSM",
+    "arm": "ARM", "arm holdings": "ARM",
+    "micron": "MU",
+    "applied materials": "AMAT",
+    "lam research": "LRCX",
+    "marvell": "MRVL",
+    "super micro": "SMCI", "supermicro": "SMCI",
+    "dell": "DELL",
+    "hp": "HPQ",
+    "hpe": "HPE",
+    "western digital": "WDC",
+
+    # Auto
+    "ford": "F", "ford motor": "F",
+    "general motors": "GM",
+    "rivian": "RIVN",
+    "lucid": "LCID",
+    "nio": "NIO",
+    "xpeng": "XPEV",
+    "li auto": "LI",
+    "stellantis": "STLA",
+    "toyota": "TM",
+    "honda": "HMC",
+
+    # Finance / banks
+    "jpmorgan": "JPM", "jp morgan": "JPM", "jpmorgan chase": "JPM",
+    "bank of america": "BAC",
+    "wells fargo": "WFC",
+    "citigroup": "C", "citi": "C",
+    "goldman sachs": "GS", "goldman": "GS",
+    "morgan stanley": "MS",
+    "charles schwab": "SCHW",
+    "blackrock": "BLK",
+    "blackstone": "BX",
+    "kkr": "KKR",
+    "american express": "AXP", "amex": "AXP",
+    "visa": "V",
+    "mastercard": "MA",
+    "berkshire hathaway": "BRK.B", "berkshire": "BRK.B",
+    "us bancorp": "USB",
+    "pnc": "PNC", "pnc financial": "PNC",
+    "truist": "TFC",
+    "capital one": "COF",
+    "discover financial": "DFS", "discover": "DFS",
+    "synchrony": "SYF",
+    "ally": "ALLY", "ally financial": "ALLY",
+    "sofi": "SOFI",
+
+    # Retail & consumer
+    "walmart": "WMT",
+    "costco": "COST",
+    "target": "TGT",
+    "home depot": "HD",
+    "lowes": "LOW", "lowe's": "LOW",
+    "tjx": "TJX",
+    "dollar general": "DG",
+    "dollar tree": "DLTR",
+    "best buy": "BBY",
+    "kroger": "KR",
+    "macy's": "M", "macys": "M",
+    "nordstrom": "JWN",
+    "kohl's": "KSS", "kohls": "KSS",
+    "gap": "GAP",
+    "nike": "NKE",
+    "lululemon": "LULU",
+    "under armour": "UAA",
+    "deckers": "DECK",
+    "crocs": "CROX",
+    "vf corp": "VFC",
+    "ralph lauren": "RL",
+    "tapestry": "TPR",
+    "capri holdings": "CPRI",
+    "estée lauder": "EL", "estee lauder": "EL",
+    "procter & gamble": "PG", "procter and gamble": "PG", "p&g": "PG",
+    "colgate": "CL", "colgate-palmolive": "CL",
+    "kimberly-clark": "KMB",
+    "unilever": "UL",
+    "clorox": "CLX",
+    "church & dwight": "CHD",
+    "coca-cola": "KO", "coke": "KO",
+    "pepsico": "PEP", "pepsi": "PEP",
+    "mondelez": "MDLZ",
+    "kraft heinz": "KHC",
+    "general mills": "GIS",
+    "kellogg": "K",
+    "tyson foods": "TSN", "tyson": "TSN",
+    "hershey": "HSY",
+    "constellation brands": "STZ",
+    "anheuser-busch": "BUD",
+    "molson coors": "TAP",
+    "philip morris": "PM",
+    "altria": "MO",
+    "starbucks": "SBUX",
+    "mcdonald's": "MCD", "mcdonalds": "MCD",
+    "chipotle": "CMG",
+    "yum brands": "YUM", "yum": "YUM",
+    "domino's": "DPZ", "dominos": "DPZ",
+    "wendy's": "WEN", "wendys": "WEN",
+    "cava": "CAVA",
+    "wingstop": "WING",
+
+    # Healthcare / pharma
+    "johnson & johnson": "JNJ", "j&j": "JNJ", "johnson and johnson": "JNJ",
+    "unitedhealth": "UNH", "unitedhealth group": "UNH",
+    "eli lilly": "LLY", "lilly": "LLY",
+    "pfizer": "PFE",
+    "merck": "MRK",
+    "abbvie": "ABBV",
+    "abbott": "ABT", "abbott laboratories": "ABT",
+    "thermo fisher": "TMO",
+    "danaher": "DHR",
+    "medtronic": "MDT",
+    "bristol myers": "BMY", "bristol-myers squibb": "BMY",
+    "amgen": "AMGN",
+    "gilead": "GILD",
+    "regeneron": "REGN",
+    "vertex pharmaceuticals": "VRTX", "vertex": "VRTX",
+    "biogen": "BIIB",
+    "moderna": "MRNA",
+    "novavax": "NVAX",
+    "biontech": "BNTX",
+    "novo nordisk": "NVO",
+    "astrazeneca": "AZN",
+    "gsk": "GSK", "glaxosmithkline": "GSK",
+    "sanofi": "SNY",
+    "roche": "RHHBY",
+    "novartis": "NVS",
+    "cvs": "CVS", "cvs health": "CVS",
+    "walgreens": "WBA",
+    "humana": "HUM",
+    "cigna": "CI",
+    "elevance health": "ELV", "anthem": "ELV",
+    "intuitive surgical": "ISRG",
+    "boston scientific": "BSX",
+    "stryker": "SYK",
+    "edwards lifesciences": "EW",
+    "becton dickinson": "BDX",
+    "zoetis": "ZTS",
+    "idexx": "IDXX",
+    "dexcom": "DXCM",
+    "iqvia": "IQV",
+
+    # Energy
+    "exxonmobil": "XOM", "exxon mobil": "XOM", "exxon": "XOM",
+    "chevron": "CVX",
+    "conocophillips": "COP",
+    "marathon petroleum": "MPC",
+    "valero": "VLO",
+    "phillips 66": "PSX",
+    "occidental": "OXY", "occidental petroleum": "OXY",
+    "schlumberger": "SLB",
+    "halliburton": "HAL",
+    "baker hughes": "BKR",
+    "eog resources": "EOG",
+    "pioneer natural resources": "PXD",
+    "devon energy": "DVN",
+    "diamondback energy": "FANG",
+    "kinder morgan": "KMI",
+    "williams companies": "WMB",
+    "duke energy": "DUK",
+    "southern company": "SO",
+    "nextera energy": "NEE",
+    "constellation energy": "CEG",
+    "vistra": "VST",
+
+    # Industrials & defense
+    "boeing": "BA",
+    "lockheed martin": "LMT", "lockheed": "LMT",
+    "raytheon": "RTX", "rtx": "RTX",
+    "northrop grumman": "NOC", "northrop": "NOC",
+    "general dynamics": "GD",
+    "honeywell": "HON",
+    "general electric": "GE",
+    "ge aerospace": "GE",
+    "3m": "MMM",
+    "caterpillar": "CAT",
+    "deere": "DE", "john deere": "DE",
+    "emerson electric": "EMR",
+    "rockwell automation": "ROK",
+    "eaton": "ETN",
+    "parker hannifin": "PH",
+    "illinois tool works": "ITW",
+    "fedex": "FDX",
+    "ups": "UPS", "united parcel service": "UPS",
+    "union pacific": "UNP",
+    "norfolk southern": "NSC",
+    "csx": "CSX",
+    "delta air lines": "DAL", "delta": "DAL",
+    "united airlines": "UAL", "united airlines holdings": "UAL",
+    "american airlines": "AAL",
+    "southwest airlines": "LUV", "southwest": "LUV",
+    "jetblue": "JBLU",
+    "alaska air": "ALK",
+
+    # Communications & media
+    "verizon": "VZ",
+    "at&t": "T", "att": "T",
+    "t-mobile": "TMUS",
+    "comcast": "CMCSA",
+    "charter communications": "CHTR",
+    "disney": "DIS", "walt disney": "DIS",
+    "warner bros discovery": "WBD",
+    "paramount": "PARA",
+    "live nation": "LYV",
+
+    # REITs & real estate
+    "american tower": "AMT",
+    "prologis": "PLD",
+    "equinix": "EQIX",
+    "crown castle": "CCI",
+    "public storage": "PSA",
+    "realty income": "O",
+    "simon property": "SPG",
+    "digital realty": "DLR",
+    "welltower": "WELL",
+
+    # Materials
+    "linde": "LIN",
+    "air products": "APD",
+    "sherwin-williams": "SHW",
+    "ecolab": "ECL",
+    "dow": "DOW",
+    "dupont": "DD",
+    "nucor": "NUE",
+    "freeport-mcmoran": "FCX",
+    "newmont": "NEM",
+    "alcoa": "AA",
+    "us steel": "X",
+    "cleveland-cliffs": "CLF",
+
+    # Other notable
+    "intuit": "INTU",
+    "automatic data processing": "ADP", "adp": "ADP",
+    "paychex": "PAYX",
+    "moody's": "MCO",
+    "s&p global": "SPGI",
+    "msci": "MSCI",
+    "cme group": "CME", "cme": "CME",
+    "nasdaq inc": "NDAQ",
+    "intercontinental exchange": "ICE", "ice": "ICE",
+    "marsh & mclennan": "MMC",
+    "aon": "AON",
+    "chubb": "CB",
+    "progressive": "PGR",
+    "allstate": "ALL",
+    "metlife": "MET",
+    "prudential": "PRU",
+    "aflac": "AFL",
+    "travelers": "TRV",
+    "mongodb": "MDB",
+    "elastic": "ESTC",
+    "splunk": "SPLK",
+    "workday": "WDAY",
+    "veeva": "VEEV",
+    "hubspot": "HUBS",
+    "monday.com": "MNDY",
+    "asana": "ASAN",
+    "gitlab": "GTLB",
+    "confluent": "CFLT",
+    "unity software": "U",
+    "rocket lab": "RKLB",
+    "iridium": "IRDM",
+    "garmin": "GRMN",
+    "etsy": "ETSY",
+    "ebay": "EBAY",
+    "wayfair": "W",
+    "carvana": "CVNA",
+    "opendoor": "OPEN",
+    "zillow": "Z",
+    "redfin": "RDFN",
+    "draftkings": "DKNG",
+    "penn entertainment": "PENN",
+    "las vegas sands": "LVS",
+    "wynn resorts": "WYNN",
+    "mgm resorts": "MGM",
+    "caesars": "CZR",
+    "marriott": "MAR",
+    "hilton": "HLT",
+    "booking holdings": "BKNG", "booking.com": "BKNG",
+    "expedia": "EXPE",
+    "carnival": "CCL",
+    "royal caribbean": "RCL",
+    "norwegian cruise": "NCLH",
+    "peloton": "PTON",
+    "beyond meat": "BYND",
+    "oatly": "OTLY",
+    "celsius holdings": "CELH", "celsius": "CELH",
+    "monster beverage": "MNST",
+}
+
+# Build a sorted-by-length-desc list of (lowercase_name, ticker) for matching
+# longest names first (so "bristol-myers squibb" matches before "bristol myers")
+_COMPANY_MATCH_LIST = sorted(
+    COMPANY_TO_TICKER.items(),
+    key=lambda kv: -len(kv[0])
+)
+
+# Cache for live Yahoo lookups (company name → ticker) — populated as needed.
+_NAME_LOOKUP_CACHE = {}
+
+def resolve_company_to_ticker(name):
+    """Lookup an unknown company name via Yahoo's search endpoint. Cached.
+    Returns ticker string or None. Network call, but cached so only once per name."""
+    name_key = name.strip().lower()
+    if not name_key or len(name_key) < 3:
+        return None
+    if name_key in _NAME_LOOKUP_CACHE:
+        return _NAME_LOOKUP_CACHE[name_key]
+    try:
+        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={quote_plus(name)}&quotesCount=3&newsCount=0"
+        req = Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+        })
+        with urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        quotes = data.get("quotes") or []
+        # Prefer US-listed equities
+        for q in quotes:
+            if q.get("quoteType") != "EQUITY":
+                continue
+            exch = (q.get("exchange") or "").upper()
+            if exch in ("NMS", "NYQ", "NGM", "PCX", "ASE", "BATS"):  # US exchanges
+                tkr = q.get("symbol", "").upper()
+                if tkr and "." not in tkr:  # avoid foreign listings like BABA.HK
+                    _NAME_LOOKUP_CACHE[name_key] = tkr
+                    return tkr
+        # Fallback: first equity result of any exchange
+        for q in quotes:
+            if q.get("quoteType") == "EQUITY":
+                tkr = q.get("symbol", "").upper()
+                if tkr:
+                    _NAME_LOOKUP_CACHE[name_key] = tkr
+                    return tkr
+    except Exception as e:
+        LOGGER.debug(f"Yahoo name lookup failed for '{name}': {e}")
+    _NAME_LOOKUP_CACHE[name_key] = None
+    return None
+
 _RE_DOLLAR_TICK = re.compile(r"\$([A-Z]{1,5})\b")
 _RE_PAREN_TICK  = re.compile(
     r"\(\s*(?:NYSE|NASDAQ|NasdaqGS|NasdaqGM|NasdaqCM|AMEX|OTC|NYSEARCA|NYSEAM|NYSE\s+American|TSX|TSXV|LSE)\s*:\s*([A-Z\.]{1,6})\s*\)",
@@ -686,29 +1076,79 @@ _RE_PAREN_TICK  = re.compile(
 )
 _RE_BARE_TICK = re.compile(r"\b([A-Z]{2,5})\b")
 
-def extract_tickers(text):
+# Match a company name followed by a corporate suffix — captures the FULL phrase
+# including the suffix so we can try resolving via Yahoo if not in our dictionary.
+_RE_NAMED_COMPANY = re.compile(
+    r"\b([A-Z][A-Za-z0-9&\.\-]+(?:\s+[A-Z][A-Za-z0-9&\.\-]+){0,4})\s+"
+    r"(Inc\.?|Incorporated|Corp\.?|Corporation|Co\.?|Ltd\.?|Limited|LLC|"
+    r"Holdings?|Group|Technologies|Therapeutics|Pharmaceuticals?|Biosciences?|"
+    r"Labs?|Resources?|Energy|Industries|Systems|Networks?|Partners|"
+    r"Capital|Bancorp|Financial)\b"
+)
+
+def extract_tickers(text, allow_network=True):
+    """
+    Extract tickers from text. Strategy:
+    1. Explicit $TICK and (NASDAQ:TICK) — strongest signal
+    2. Company-name lookup from bundled dictionary
+    3. Named entity + corporate suffix (e.g. "G-III Apparel Group") → Yahoo lookup (if network)
+    4. Bare ALL-CAPS with stock context — last resort
+    """
     if not text:
         return []
     found, seen = [], set()
+
+    # Strategy 1: explicit dollar-prefixed tickers
     for m in _RE_DOLLAR_TICK.findall(text):
         t = m.upper()
         if t not in seen and t not in TICKER_BLACKLIST:
             seen.add(t); found.append(t)
+
+    # Strategy 1b: explicit (EXCHANGE:TICK) format
     for m in _RE_PAREN_TICK.findall(text):
         t = m.upper()
         if t not in seen and t not in TICKER_BLACKLIST:
             seen.add(t); found.append(t)
+
+    # Strategy 2: bundled company dictionary
+    text_lower = text.lower()
+    for name, ticker in _COMPANY_MATCH_LIST:
+        if ticker in seen:
+            continue
+        # Word-boundary match
+        pattern = r"\b" + re.escape(name) + r"\b"
+        if re.search(pattern, text_lower):
+            seen.add(ticker); found.append(ticker)
+            if len(found) >= 6:
+                break
+
+    # Strategy 3: corporate-suffix-named entities → Yahoo lookup
+    if allow_network and len(found) < 3:
+        for m in _RE_NAMED_COMPANY.finditer(text):
+            full_name = m.group(0)
+            # Avoid lookups that are too generic
+            if len(full_name) < 8:
+                continue
+            tkr = resolve_company_to_ticker(full_name)
+            if tkr and tkr not in seen and tkr not in TICKER_BLACKLIST:
+                seen.add(tkr); found.append(tkr)
+                if len(found) >= 6:
+                    break
+
+    # Strategy 4: bare ALL-CAPS only if nothing else worked
     if not found:
         for m in _RE_BARE_TICK.findall(text):
             if m in TICKER_BLACKLIST or m in seen:
                 continue
             if re.search(
-                rf"\b{m}\b\s+(?:shares|stock|Corp|Corp\.|Inc|Inc\.|Ltd|Holdings|Technologies|Therapeutics|Pharmaceuticals|Biosciences|Group|plc|N\.V\.)\b",
+                rf"\b{m}\b\s+(?:shares|stock|Corp|Corp\.|Inc|Inc\.|Ltd|Holdings|"
+                rf"Technologies|Therapeutics|Pharmaceuticals|Biosciences|Group|plc|N\.V\.)\b",
                 text,
             ):
                 seen.add(m); found.append(m)
-                if len(found) >= 5:
+                if len(found) >= 3:
                     break
+
     return found[:6]
 
 # ───────────────────────────── SCORING ────────────────────────────────────────
