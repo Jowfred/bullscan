@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.4.0"
+APP_VERSION = "3.5.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -80,12 +80,70 @@ RSS_FEEDS = {
         "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies",
     ],
     "SEC EDGAR": [
+        # 8-K (current report) — material events
         "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=include&count=40&output=atom",
+        # 10-Q (quarterly) — for earnings-related catalysts
+        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-Q&company=&dateb=&owner=include&count=20&output=atom",
     ],
     "Yahoo Finance": [
         "https://finance.yahoo.com/news/rssindex",
     ],
+    "CNBC": [
+        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664",  # top news
+        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069",  # markets
+        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=19854910",  # earnings
+    ],
+    "Seeking Alpha": [
+        "https://seekingalpha.com/feed.xml",
+    ],
+    "Motley Fool": [
+        "https://www.fool.com/feeds/index.aspx",
+    ],
+    "Investing.com": [
+        "https://www.investing.com/rss/news_25.rss",   # stock market
+        "https://www.investing.com/rss/news_356.rss",  # earnings
+    ],
+    "PR Newswire": [
+        # Financial Services subset — heavily company-press-release driven
+        "https://www.prnewswire.com/rss/financial-services-latest-news/financial-services-latest-news-list.rss",
+        # Health Care / Biotech subset — useful for FDA catalysts
+        "https://www.prnewswire.com/rss/health/health-latest-news-list.rss",
+    ],
+    "Business Wire": [
+        "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEVtRVw==",  # earnings
+    ],
+    "AP Business": [
+        "https://rsshub.app/apnews/topics/business",
+    ],
+    "FinancialJuice": [
+        "https://www.financialjuice.com/feeds/rss/news.aspx",
+    ],
 }
+
+# ─── Source quality tiers ─────────────────────────────────────────────────────
+# Tier 1: regulatory / company-direct disclosures (highest signal-to-noise)
+# Tier 2: top-tier financial journalism (reliable but secondhand)
+# Tier 3: aggregators / opinion-leaning (useful but more noise)
+SOURCE_TIERS = {
+    "SEC EDGAR":     (1, "Regulatory filing", "#10b981"),
+    "Business Wire": (1, "Company press release", "#10b981"),
+    "PR Newswire":   (1, "Company press release", "#10b981"),
+    "GlobeNewswire": (1, "Company press release", "#10b981"),
+    "Reuters":       (2, "Top-tier journalism", "#22d3ee"),
+    "AP Business":   (2, "Top-tier journalism", "#22d3ee"),
+    "CNBC":          (2, "Financial journalism", "#22d3ee"),
+    "MarketWatch":   (2, "Financial journalism", "#22d3ee"),
+    "Investing.com": (3, "Aggregator", "#a3a3a3"),
+    "Yahoo Finance": (3, "Aggregator", "#a3a3a3"),
+    "Benzinga":      (3, "Fast but noisy", "#f59e0b"),
+    "Seeking Alpha": (3, "Opinion / analysis", "#f59e0b"),
+    "Motley Fool":   (3, "Opinion / analysis", "#f59e0b"),
+    "FinancialJuice":(3, "Breaking-news feed", "#a3a3a3"),
+}
+
+def source_tier(source):
+    """Return (tier_int, label, color) for a source. Defaults to tier 3."""
+    return SOURCE_TIERS.get(source, (3, "Unknown source", "#a3a3a3"))
 
 CATALYST_KEYWORDS = {
     "Earnings Beat": {
@@ -1504,6 +1562,90 @@ def _filter_to_common_stock(tickers):
 
 # ───────────────────────────── SCORING ────────────────────────────────────────
 
+# ───────────────────────────── JUNK FILTER ────────────────────────────────────
+# Drop low-signal stories BEFORE they get scored. Saves processing and cuts noise.
+
+# Listicle / clickbait patterns. Things like "5 stocks to buy", "Top 10 picks"
+_RE_LISTICLE = re.compile(
+    r"^\s*\d{1,2}\s+(?:stocks|things|reasons|ways|ETFs?|funds|tips|picks|"
+    r"companies|moves|tricks|secrets|trends|charts|catalysts)\b|"
+    r"\btop\s+\d{1,2}\s+(?:stocks|picks|companies|trades|catalysts|ideas)\b|"
+    r"\bbest\s+(?:stocks|picks)\s+(?:to|for|of|in)\b|"
+    r"\b(?:my|our)\s+top\s+\d+\s+(?:stocks|picks)\b",
+    re.IGNORECASE,
+)
+
+# Generic market commentary / no specific company
+_RE_MARKET_COMMENTARY = re.compile(
+    r"^\s*(?:stocks?|markets?|wall\s+street|s&p\s+500|dow|nasdaq|"
+    r"futures|treasury(?:\s+yields?)?|bond\s+yields?|oil\s+prices?|"
+    r"gold\s+prices?|dollar|currency|crypto(?:currency)?|bitcoin\s+price)"
+    r"\s+(?:rise|rises|risen|fall|falls|fallen|drop|drops|"
+    r"slide|sliding|gain|gains|rally|rallies|rallying|"
+    r"jump|jumps|surge|surges|tumble|tumbles|"
+    r"climb|climbs|edge|edges|tick|ticks|mixed|flat|"
+    r"open|opens|opened|close|closes|closed)\b",
+    re.IGNORECASE,
+)
+
+# Opinion / analysis pieces with no specific catalyst language
+_RE_OPINION = re.compile(
+    r"\b(?:why\s+(?:i|you|we|they)\s+(?:bought|sold|like|hate|prefer|own|wouldn'?t))\b|"
+    r"\b(?:is\s+\w+\s+stock\s+a\s+buy)\b|"
+    r"\b(?:should\s+you\s+(?:buy|sell|own|invest))\b|"
+    r"\b(?:here'?s\s+why)\b|"
+    r"\b(?:bull|bear)\s+case\s+for\b|"
+    r"\b(?:opinion|analysis|commentary|column|column:)\b",
+    re.IGNORECASE,
+)
+
+# Sponsored / paid placement markers
+_RE_SPONSORED = re.compile(
+    r"\b(?:sponsored|sponsor|paid\s+post|paid\s+content|promoted|"
+    r"advertorial|ad:|\[ad\]|partner\s+content)\b",
+    re.IGNORECASE,
+)
+
+# Generic "watchlist" / "movers" roundups
+_RE_ROUNDUP = re.compile(
+    r"\b(?:stocks?\s+to\s+watch|stocks?\s+on\s+(?:my|our|the)\s+radar|"
+    r"trending\s+(?:tickers?|stocks?)|(?:morning|midday|after-?hours?)\s+(?:movers|gainers|losers)|"
+    r"(?:premarket|pre-market)\s+movers|biggest\s+(?:gainers|losers)\s+(?:today|this\s+week))\b",
+    re.IGNORECASE,
+)
+
+
+def is_junk_story(title, summary=""):
+    """
+    Returns (is_junk: bool, reason: str). Filter out clickbait, generic
+    market commentary, opinion pieces, sponsored content, and listicles
+    BEFORE we waste time scoring them.
+    """
+    if not title or len(title) < 10:
+        return True, "too-short title"
+
+    title_clean = title.strip()
+
+    if _RE_SPONSORED.search(title_clean) or _RE_SPONSORED.search(summary or ""):
+        return True, "sponsored content"
+
+    if _RE_LISTICLE.search(title_clean):
+        return True, "listicle"
+
+    if _RE_ROUNDUP.search(title_clean):
+        return True, "roundup / movers list"
+
+    # Generic market commentary — only filter if NO specific company is named.
+    # We catch this in the no-ticker filter later, but quick-reject obvious ones.
+    if _RE_MARKET_COMMENTARY.match(title_clean):
+        return True, "generic market commentary"
+
+    if _RE_OPINION.search(title_clean):
+        return True, "opinion / analysis piece"
+
+    return False, ""
+
+
 def score_story(title, summary):
     """Returns (score 0-100, list of catalyst tags, breakdown list).
     Breakdown is a list of (label, delta, source_text) tuples explaining scoring."""
@@ -1757,7 +1899,12 @@ class StoryDetailPanel(tk.Frame):
         tk.Label(meta, text=s["source"].upper(), bg=PALETTE["panel"],
                  fg=PALETTE["accent"], font=(FONT_DISPLAY, 9, "bold")
                  ).pack(side="left")
-        tk.Label(meta, text=f"  ·  {time_ago(s['published'])}",
+        tier_num, tier_label, tier_color = source_tier(s["source"])
+        tk.Label(meta, text=f"   TIER {tier_num} · {tier_label}",
+                 bg=PALETTE["panel"], fg=tier_color,
+                 font=(FONT_DISPLAY, 8, "bold")
+                 ).pack(side="left")
+        tk.Label(meta, text=f"   ·  {time_ago(s['published'])}",
                  bg=PALETTE["panel"], fg=PALETTE["text_mute"],
                  font=(FONT_DISPLAY, 9)).pack(side="left")
 
@@ -2238,13 +2385,20 @@ class StoryCard(tk.Frame):
         content = tk.Frame(self, bg=PALETTE["panel"])
         content.pack(side="left", fill="both", expand=True)
 
-        # Top: source · time · score
+        # Top: source · tier · time · score
         top = tk.Frame(content, bg=PALETTE["panel"])
         top.pack(fill="x", padx=14, pady=(11, 4))
 
         tk.Label(top, text=s["source"].upper(), bg=PALETTE["panel"],
                  fg=PALETTE["accent"], font=(FONT_DISPLAY, 8, "bold")
                  ).pack(side="left")
+
+        # Source-tier badge — small dot next to the source name
+        tier_num, tier_label, tier_color = source_tier(s["source"])
+        tk.Label(top, text=f"  T{tier_num}", bg=PALETTE["panel"],
+                 fg=tier_color, font=(FONT_DISPLAY, 8, "bold")
+                 ).pack(side="left")
+
         tk.Label(top, text=f"  ·  {time_ago(s['published'])}",
                  bg=PALETTE["panel"], fg=PALETTE["text_mute"],
                  font=(FONT_DISPLAY, 9)).pack(side="left")
@@ -3057,6 +3211,25 @@ class PreMarketScanner(tk.Tk):
             # Capture pinned story keys at the start of this fetch so the worker
             # can safely use them off the main thread.
             pinned_keys_snapshot = set(self.pinned_stories)
+
+            # ─── Junk filter pass ───
+            # Drop obvious clickbait, listicles, generic market commentary, etc.
+            # Always keep pinned stories regardless.
+            kept = []
+            junk_count = 0
+            for s in stories:
+                story_key = re.sub(r"[^a-z0-9]+", "", s["title"].lower())[:120]
+                if story_key in pinned_keys_snapshot:
+                    kept.append(s)
+                    continue
+                is_junk, reason = is_junk_story(s["title"], s.get("summary", ""))
+                if is_junk:
+                    junk_count += 1
+                    continue
+                kept.append(s)
+            if junk_count:
+                LOGGER.info(f"Junk filter removed {junk_count} stories")
+            stories = kept
 
             for s in stories:
                 score, cats, breakdown = score_story(s["title"], s.get("summary", ""))
