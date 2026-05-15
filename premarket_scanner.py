@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.5.1"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -3266,18 +3266,48 @@ class PreMarketScanner(tk.Tk):
             new_keys = {s["story_key"] for s in stories}
             current_session = session_date_for(datetime.now(timezone.utc))
             today_market_open_passed = _market_open_passed_today()
+            today_market_closed = market_is_closed_for_today()
+
+            # ─── Clean up the live (RSS) story list ───
+            # Once today's market has closed, today's pre-market stories are
+            # no longer actionable. Drop anything older than today's open unless
+            # the user has pinned it.
+            if today_market_closed:
+                now_et = datetime.now(ET_ZONE)
+                # Cutoff: today's market open at 9:30 AM ET
+                today_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                today_open_utc = today_open.astimezone(timezone.utc)
+
+                kept = []
+                stale_count = 0
+                for s in stories:
+                    if s.get("pinned"):
+                        kept.append(s)
+                        continue
+                    pub = s.get("published")
+                    if pub and pub < today_open_utc:
+                        stale_count += 1
+                        continue
+                    kept.append(s)
+                if stale_count:
+                    LOGGER.info(f"Post-close cleanup: dropped {stale_count} stale pre-market stories")
+                stories = kept
 
             for p in persisted:
                 if p["story_key"] in new_keys:
                     continue
                 is_pinned = p["story_key"] in pinned_keys_snapshot
 
-                # Apply the "remove old stories after next market open" rule:
+                # Apply the "remove old stories" rule:
                 # - If pinned: always keep
-                # - If from current session: keep
                 # - If from a previous session AND today's market open has passed: drop
+                # - If from current session BUT today's market has closed: drop
+                #   (today's pre-market stories are no longer actionable after close)
                 if not is_pinned:
-                    if p.get("session_date") != current_session and today_market_open_passed:
+                    same_session = p.get("session_date") == current_session
+                    if not same_session and today_market_open_passed:
+                        continue
+                    if same_session and today_market_closed:
                         continue
 
                 # If this persisted story was saved before the better ticker extractor
