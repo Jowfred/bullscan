@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.5.1"
+APP_VERSION = "3.6.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -1648,7 +1648,11 @@ def is_junk_story(title, summary=""):
 
 def score_story(title, summary):
     """Returns (score 0-100, list of catalyst tags, breakdown list).
-    Breakdown is a list of (label, delta, source_text) tuples explaining scoring."""
+    Breakdown is a list of (label, delta, source_text) tuples explaining scoring.
+
+    This is the text-only score. Price-context bonuses (buyout premium, volume
+    multiplier, reverse-split warning) are added later via apply_price_context()
+    after we've fetched live data for the story's ticker."""
     text = f"{title}\n{summary}".lower()
     score = 0
     tags = []
@@ -1689,6 +1693,155 @@ def score_story(title, summary):
 
     final = max(0, min(100, score))
     return final, tags, breakdown
+
+
+# ─── Price-context scoring ────────────────────────────────────────────────────
+# These bonuses/penalties depend on live price data for the story's ticker(s).
+# Applied after the base text-score has been computed.
+
+# Match a tender / buyout offer price embedded in a headline or summary.
+# Examples that should match:
+#   "agrees to acquire X for $45.00 per share"
+#   "to be acquired at $12.50 a share"
+#   "tender offer of $30 per share"
+#   "all-cash deal valued at $25 per share"
+_RE_BUYOUT_PRICE = re.compile(
+    r"(?:for|at|of|valued\s+at|priced\s+at)\s+\$?(\d{1,4}(?:\.\d{1,4})?)\s+"
+    r"(?:per|a)\s+share",
+    re.IGNORECASE,
+)
+
+# Match recent reverse-split language in summary/title.
+_RE_REVERSE_SPLIT = re.compile(
+    r"\breverse\s+(?:stock\s+)?split\b|\b\d+[-\s]?(?:for|to|:)[-\s]?\d+\s+reverse\b",
+    re.IGNORECASE,
+)
+
+
+def extract_buyout_price(text):
+    """Return the buyout/tender offer price in dollars as a float, or None.
+    Only triggers if the surrounding context looks like a real M&A offer
+    (not just a random per-share figure like dividend rate)."""
+    if not text:
+        return None
+    # Context check — must be near M&A language to count
+    text_lower = text.lower()
+    has_ma_context = bool(re.search(
+        r"\b(?:acquire|acquisition|buyout|tender\s+offer|merger|"
+        r"definitive\s+agreement|takeover|all[-\s]cash|going\s+private)\b",
+        text_lower,
+    ))
+    if not has_ma_context:
+        return None
+    m = _RE_BUYOUT_PRICE.search(text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except (ValueError, IndexError):
+        return None
+
+
+def has_reverse_split_language(text):
+    """True if the story text mentions a (recent) reverse split."""
+    return bool(text and _RE_REVERSE_SPLIT.search(text))
+
+
+def apply_price_context(base_score, breakdown, story, price_data):
+    """
+    Apply price-context bonuses to an already-scored story.
+
+    Args:
+        base_score: int, the text-only score (0-100)
+        breakdown: list, the existing breakdown entries (will be appended to)
+        story: dict, the full story (used for title/summary, tickers, catalysts)
+        price_data: dict from fetch_daily_performance() or fetch_quote(), or None
+
+    Returns:
+        (new_score, new_breakdown, warnings)
+        warnings is a list of strings describing soft warnings (e.g. reverse split)
+        that the UI should display but that don't change the score.
+    """
+    score = base_score
+    warnings = []
+
+    text = f"{story.get('title','')}\n{story.get('summary','')}"
+
+    # ─── Reverse-split warning (informational, not a score change) ───────────
+    if has_reverse_split_language(text):
+        warnings.append("Recent reverse split mentioned — verify share count history")
+
+    if not price_data:
+        return score, breakdown, warnings
+
+    current_price = price_data.get("price")
+    if not current_price or current_price <= 0:
+        return score, breakdown, warnings
+
+    # ─── Tender / buyout premium bonus ───────────────────────────────────────
+    # If a story says "to be acquired at $X per share" and the stock is
+    # trading below X, that's a real arbitrage signal — investors will buy
+    # to close the spread. Bonus scales with premium size, capped.
+    buyout_price = extract_buyout_price(text)
+    if buyout_price and buyout_price > 0:
+        premium_pct = (buyout_price - current_price) / current_price * 100
+        if premium_pct > 50:
+            # Suspicious — probably hit on the wrong $ figure
+            pass
+        elif premium_pct >= 20:
+            bonus = 18
+            score += bonus
+            breakdown.append((
+                "Large buyout premium",
+                bonus,
+                f"offer ${buyout_price:.2f} vs ${current_price:.2f} ({premium_pct:+.1f}%)",
+            ))
+        elif premium_pct >= 8:
+            bonus = 12
+            score += bonus
+            breakdown.append((
+                "Buyout premium",
+                bonus,
+                f"offer ${buyout_price:.2f} vs ${current_price:.2f} ({premium_pct:+.1f}%)",
+            ))
+        elif premium_pct >= 2:
+            bonus = 6
+            score += bonus
+            breakdown.append((
+                "Small buyout premium",
+                bonus,
+                f"offer ${buyout_price:.2f} vs ${current_price:.2f} ({premium_pct:+.1f}%)",
+            ))
+        elif premium_pct < -2:
+            # Stock trading ABOVE the offer = market expects a higher bid OR
+            # offer was rejected. Don't penalize; flag it.
+            warnings.append(
+                f"Stock trading above offer price (${current_price:.2f} > ${buyout_price:.2f}) — "
+                "market may expect a higher bid"
+            )
+
+    # ─── Volume multiplier bonus ─────────────────────────────────────────────
+    # Unusual volume confirms the market is reacting to a catalyst.
+    vol = price_data.get("volume")
+    avg_vol = price_data.get("avg_volume_30d")
+    if vol and avg_vol and avg_vol > 0:
+        multiple = vol / avg_vol
+        if multiple >= 5.0:
+            bonus = 10
+            score += bonus
+            breakdown.append(("Extreme volume", bonus, f"{multiple:.1f}x 30d average"))
+        elif multiple >= 3.0:
+            bonus = 7
+            score += bonus
+            breakdown.append(("High volume", bonus, f"{multiple:.1f}x 30d average"))
+        elif multiple >= 2.0:
+            bonus = 4
+            score += bonus
+            breakdown.append(("Elevated volume", bonus, f"{multiple:.1f}x 30d average"))
+
+    score = max(0, min(100, score))
+    return score, breakdown, warnings
+
 
 def conviction_label(score, has_bearish):
     """Plain-English label for a score. NOT a trade recommendation."""
@@ -1988,6 +2141,21 @@ class StoryDetailPanel(tk.Frame):
                 tk.Label(cat_wrap, text=f"  {cat}  ", bg=color, fg="#0a0e1c",
                          font=(FONT_DISPLAY, 9, "bold")
                          ).pack(side="left", padx=(0, 6), pady=2)
+
+        # Soft warnings — informational, not score-changing
+        if s.get("warnings"):
+            self._section(body, "WARNINGS  ·  WORTH CHECKING")
+            for w in s["warnings"]:
+                warn_row = tk.Frame(body, bg=PALETTE["panel_alt"])
+                warn_row.pack(fill="x", padx=24, pady=2)
+                tk.Label(warn_row, text="  ⚠️  ", bg=PALETTE["warn"], fg="#0a0e1c",
+                         font=(FONT_DISPLAY, 11, "bold")
+                         ).pack(side="left")
+                tk.Label(warn_row, text=f"  {w}", bg=PALETTE["panel_alt"],
+                         fg=PALETTE["text"], font=(FONT_DISPLAY, 10),
+                         anchor="w", justify="left", wraplength=640
+                         ).pack(side="left", fill="x", expand=True, padx=(4, 8), pady=8)
+            tk.Frame(body, bg=PALETTE["bg"], height=8).pack(fill="x", padx=24)
 
         self._section(body, "SCORE BREAKDOWN")
         bd = s.get("breakdown", [])
@@ -2481,6 +2649,14 @@ class StoryCard(tk.Frame):
         for cat in s.get("catalysts", []):
             color = CATEGORY_COLORS.get(cat, PALETTE["accent"])
             tk.Label(bot, text=f" {cat} ", bg=color, fg="#0a0e1c",
+                     font=(FONT_DISPLAY, 8, "bold")
+                     ).pack(side="left", padx=(0, 5))
+
+        # Soft warnings (reverse split, premium issues, etc.) — don't change
+        # the score but flag them next to the catalysts so the user is informed.
+        if s.get("warnings"):
+            tk.Label(bot, text=f" ⚠️ {len(s['warnings'])}  ",
+                     bg=PALETTE["warn"], fg="#0a0e1c",
                      font=(FONT_DISPLAY, 8, "bold")
                      ).pack(side="left", padx=(0, 5))
 
@@ -3240,10 +3416,37 @@ class PreMarketScanner(tk.Tk):
                 s["watch_match"] = bool(self.watchlist & set(s["tickers"]))
                 s["story_key"] = re.sub(r"[^a-z0-9]+", "", s["title"].lower())[:120]
                 s["pinned"] = s["story_key"] in pinned_keys_snapshot
+                s["warnings"] = []
+
+                # ─── Price-context scoring ───
+                # Apply live-price bonuses ONLY when worth the network cost:
+                # - M&A / Buyout catalyst tag (need to check premium) OR
+                # - Base score already meaningful (>=25) AND has a ticker
+                # This caps Yahoo calls to roughly the same number of stories
+                # we already persist.
+                if s["tickers"] and (
+                    "M&A / Buyout" in cats or score >= 25 or s["pinned"]
+                ):
+                    first_ticker = s["tickers"][0]
+                    try:
+                        # Prefer full daily perf (gives us volume); falls back to quote
+                        price_data = fetch_daily_performance(first_ticker) \
+                                     or fetch_quote(first_ticker)
+                    except Exception as e:
+                        LOGGER.debug(f"Price context fetch failed for {first_ticker}: {e}")
+                        price_data = None
+
+                    new_score, new_breakdown, warnings = apply_price_context(
+                        score, list(breakdown), s, price_data
+                    )
+                    if new_score != score or warnings:
+                        s["score"] = new_score
+                        s["breakdown"] = new_breakdown
+                        s["warnings"] = warnings
 
                 # Persist if: high-scoring OR user has pinned this story.
                 # Pinned stories should never be lost even if score is 0.
-                should_persist = (score >= PERSIST_MIN_SCORE) or s["pinned"]
+                should_persist = (s["score"] >= PERSIST_MIN_SCORE) or s["pinned"]
                 if should_persist:
                     story_id = db_save_story(s)
                     s["db_id"] = story_id
