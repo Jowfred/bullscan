@@ -40,6 +40,13 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo  # type: ignore
 
+# Optional: embedded web view for showing articles inline
+try:
+    from tkinterweb import HtmlFrame  # type: ignore
+    TKINTERWEB_AVAILABLE = True
+except Exception:
+    TKINTERWEB_AVAILABLE = False
+
 # ───────────────────────────── CONFIG ─────────────────────────────────────────
 
 ET_ZONE = ZoneInfo("America/New_York")
@@ -54,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -910,23 +917,16 @@ def time_ago(dt):
     return dt.astimezone(ET_ZONE).strftime("%b %d, %I:%M %p ET")
 
 
-# ─────────────────────────── DETAIL MODAL ─────────────────────────────────────
+# ─────────────────────────── DETAIL PANEL ─────────────────────────────────────
 
-class StoryDetailWindow(tk.Toplevel):
-    """Modal-ish window with full story info, scoring breakdown, research links."""
+class StoryDetailPanel(tk.Frame):
+    """Inline detail view — overlays the results area inside the main window
+    instead of opening as a separate Toplevel popup."""
 
-    def __init__(self, master, story):
-        super().__init__(master)
+    def __init__(self, master, story, on_close, **kw):
+        super().__init__(master, bg=PALETTE["bg"], **kw)
         self.story = story
-        self.title("Story Details — Pre-Market Scanner")
-        self.geometry("780x720")
-        self.minsize(600, 500)
-        self.configure(bg=PALETTE["bg"])
-        try:
-            self.transient(master)
-        except Exception:
-            pass
-
+        self.on_close = on_close
         self._build()
 
     def _build(self):
@@ -936,14 +936,31 @@ class StoryDetailWindow(tk.Toplevel):
         has_bearish = any(d[1] < 0 for d in s.get("breakdown", []))
         label, label_color, label_desc = conviction_label(score, has_bearish)
 
+        # Top bar: back button + close
+        topbar = tk.Frame(self, bg=PALETTE["bg_alt"], height=44)
+        topbar.pack(fill="x")
+        topbar.pack_propagate(False)
+
+        back_btn = tk.Button(topbar, text="◀  Back to stories",
+            bg=PALETTE["bg_alt"], fg=PALETTE["accent"],
+            font=(FONT_DISPLAY, 10, "bold"), bd=0, relief="flat",
+            cursor="hand2", activebackground=PALETTE["panel"],
+            command=self.on_close, padx=14, pady=8)
+        back_btn.pack(side="left", padx=14, pady=6)
+
+        tk.Label(topbar, text="Story Details", bg=PALETTE["bg_alt"],
+                 fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 10)
+                 ).pack(side="left", pady=12)
+
+        tk.Frame(self, bg=PALETTE["border"], height=1).pack(fill="x")
+
         # Header band with score
         header = tk.Frame(self, bg=PALETTE["panel"])
         header.pack(fill="x")
 
         hpad = tk.Frame(header, bg=PALETTE["panel"])
-        hpad.pack(fill="x", padx=24, pady=20)
+        hpad.pack(fill="x", padx=24, pady=18)
 
-        # Source + time
         meta = tk.Frame(hpad, bg=PALETTE["panel"])
         meta.pack(fill="x")
         tk.Label(meta, text=s["source"].upper(), bg=PALETTE["panel"],
@@ -953,13 +970,11 @@ class StoryDetailWindow(tk.Toplevel):
                  bg=PALETTE["panel"], fg=PALETTE["text_mute"],
                  font=(FONT_DISPLAY, 9)).pack(side="left")
 
-        # Title
         tk.Label(hpad, text=s["title"], bg=PALETTE["panel"],
                  fg=PALETTE["text"], font=(FONT_DISPLAY, 14, "bold"),
                  anchor="w", justify="left", wraplength=720
                  ).pack(fill="x", pady=(8, 12))
 
-        # Score row
         score_row = tk.Frame(hpad, bg=PALETTE["panel"])
         score_row.pack(fill="x")
 
@@ -979,7 +994,7 @@ class StoryDetailWindow(tk.Toplevel):
                  anchor="w", justify="left", wraplength=600
                  ).pack(fill="x", pady=(2, 0))
 
-        # Body — scrollable
+        # Scrollable body
         body_wrap = tk.Frame(self, bg=PALETTE["bg"])
         body_wrap.pack(fill="both", expand=True)
 
@@ -996,7 +1011,6 @@ class StoryDetailWindow(tk.Toplevel):
         canvas.bind_all("<MouseWheel>",
             lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
 
-        # Summary section
         if s.get("summary"):
             self._section(body, "STORY SUMMARY")
             tk.Label(body, text=s["summary"], bg=PALETTE["bg"],
@@ -1004,20 +1018,17 @@ class StoryDetailWindow(tk.Toplevel):
                      anchor="w", justify="left", wraplength=700
                      ).pack(fill="x", padx=24, pady=(0, 16))
 
-        # Tickers & research links
         if s.get("tickers"):
             self._section(body, "TICKERS DETECTED")
             for t in s["tickers"][:6]:
                 self._ticker_card(body, t)
-
-            note = tk.Label(body,
+            tk.Label(body,
                 text="Each ticker has a TradingView chart and quick research links. "
                      "Always verify the ticker matches the company in the headline.",
                 bg=PALETTE["bg"], fg=PALETTE["text_mute"],
-                font=(FONT_DISPLAY, 8), anchor="w", justify="left", wraplength=700)
-            note.pack(fill="x", padx=24, pady=(4, 16))
+                font=(FONT_DISPLAY, 8), anchor="w", justify="left", wraplength=700
+                ).pack(fill="x", padx=24, pady=(4, 16))
 
-        # Catalyst tags
         if s.get("catalysts"):
             self._section(body, "CATALYST TAGS")
             cat_wrap = tk.Frame(body, bg=PALETTE["bg"])
@@ -1028,11 +1039,10 @@ class StoryDetailWindow(tk.Toplevel):
                          font=(FONT_DISPLAY, 9, "bold")
                          ).pack(side="left", padx=(0, 6), pady=2)
 
-        # Score breakdown
         self._section(body, "SCORE BREAKDOWN")
         bd = s.get("breakdown", [])
         if not bd:
-            tk.Label(body, text="No scoring components matched.",
+            tk.Label(body, text="No scoring components matched (likely a story loaded from previous session).",
                      bg=PALETTE["bg"], fg=PALETTE["text_mute"],
                      font=(FONT_DISPLAY, 10), anchor="w"
                      ).pack(fill="x", padx=24, pady=(0, 16))
@@ -1052,12 +1062,11 @@ class StoryDetailWindow(tk.Toplevel):
                          bg=PALETTE["panel_alt"], fg=PALETTE["text"],
                          font=(FONT_DISPLAY, 10, "bold"), anchor="w"
                          ).pack(side="left", padx=(4, 0), pady=8)
-                tk.Label(row, text=f"  “{matched}”  ",
+                tk.Label(row, text=f"  \u201C{matched}\u201D  ",
                          bg=PALETTE["panel_alt"], fg=PALETTE["text_mute"],
                          font=(FONT_DISPLAY, 9, "italic"), anchor="w"
                          ).pack(side="left", padx=(4, 8), pady=8)
 
-        # Important disclaimer
         self._section(body, "WHAT THIS SCORE MEANS")
         disc = (
             "The Bull Score is a keyword-based heuristic. A high score means the "
@@ -1065,13 +1074,13 @@ class StoryDetailWindow(tk.Toplevel):
             "(earnings beats, FDA approvals, M&A, guidance raises, etc.).\n\n"
             "A high score is NOT a trade recommendation. The market often prices "
             "in news before retail traders can react. Headlines can also be "
-            "misleading — read the source article carefully.\n\n"
+            "misleading \u2014 read the source article carefully.\n\n"
             "Before considering any trade, verify:\n"
-            "   • The actual numbers (is the beat meaningful or barely above estimates?)\n"
-            "   • Pre-market price action and volume\n"
-            "   • Float, short interest, and dilution risk\n"
-            "   • Whether the news is truly new or already known\n"
-            "   • Your own risk tolerance and position sizing\n\n"
+            "   \u2022 The actual numbers (is the beat meaningful or barely above estimates?)\n"
+            "   \u2022 Pre-market price action and volume\n"
+            "   \u2022 Float, short interest, and dilution risk\n"
+            "   \u2022 Whether the news is truly new or already known\n"
+            "   \u2022 Your own risk tolerance and position sizing\n\n"
             "This tool helps you triage news faster. The decision is yours."
         )
         tk.Label(body, text=disc, bg=PALETTE["bg"], fg=PALETTE["text_dim"],
@@ -1085,18 +1094,18 @@ class StoryDetailWindow(tk.Toplevel):
         fpad.pack(fill="x", padx=24, pady=14)
 
         if s.get("link"):
-            tk.Button(fpad, text="📰  OPEN SOURCE ARTICLE",
+            tk.Button(fpad, text="\U0001F4F0  OPEN SOURCE ARTICLE",
                 bg=PALETTE["accent"], fg="#0a0e1c",
                 font=(FONT_DISPLAY, 10, "bold"), bd=0, relief="flat",
                 activebackground=PALETTE["accent_hi"], cursor="hand2",
                 command=lambda: webbrowser.open(s["link"]),
                 padx=14, pady=8).pack(side="left")
 
-        tk.Button(fpad, text="Close",
+        tk.Button(fpad, text="\u25C0  Back to stories",
             bg=PALETTE["panel_alt"], fg=PALETTE["text_dim"],
             font=(FONT_DISPLAY, 10), bd=0, relief="flat",
             activebackground=PALETTE["panel_hover"], cursor="hand2",
-            command=self.destroy, padx=14, pady=8).pack(side="right")
+            command=self.on_close, padx=14, pady=8).pack(side="right")
 
     def _section(self, parent, title):
         hdr = tk.Frame(parent, bg=PALETTE["bg"])
@@ -1710,8 +1719,10 @@ class PreMarketScanner(tk.Tk):
             anchor="w").pack(fill="x", padx=18, pady=(0, 6))
 
     def _build_results(self, parent):
+        self._results_parent = parent
         main = tk.Frame(parent, bg=PALETTE["bg"])
         main.pack(side="right", fill="both", expand=True)
+        self._results_main = main
 
         # Tabs row
         top = tk.Frame(main, bg=PALETTE["bg"])
@@ -1925,9 +1936,31 @@ class PreMarketScanner(tk.Tk):
             f"{story['source']} | {story['title']}"
         )
         try:
-            StoryDetailWindow(self, story)
+            self._show_detail_panel(story)
         except Exception as e:
-            LOGGER.exception(f"Failed to open detail window: {e}")
+            LOGGER.exception(f"Failed to show detail panel: {e}")
+
+    def _show_detail_panel(self, story):
+        """Hide the results area and overlay the detail panel inside the main window."""
+        # Hide the results main frame
+        if hasattr(self, "_results_main"):
+            self._results_main.pack_forget()
+        # Tear down any previous detail
+        if hasattr(self, "_detail_panel") and self._detail_panel:
+            try: self._detail_panel.destroy()
+            except Exception: pass
+        # Build new panel inside the same parent
+        self._detail_panel = StoryDetailPanel(
+            self._results_parent, story, on_close=self._hide_detail_panel)
+        self._detail_panel.pack(side="right", fill="both", expand=True)
+
+    def _hide_detail_panel(self):
+        if hasattr(self, "_detail_panel") and self._detail_panel:
+            try: self._detail_panel.destroy()
+            except Exception: pass
+            self._detail_panel = None
+        if hasattr(self, "_results_main"):
+            self._results_main.pack(side="right", fill="both", expand=True)
 
     # ─────────── Fetch ───────────
     def _manual_refresh(self):
