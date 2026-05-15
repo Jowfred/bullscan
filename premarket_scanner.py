@@ -54,7 +54,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -295,42 +295,93 @@ def is_premarket_now():
 _PRICE_CACHE = {}        # ticker -> (timestamp, price_dict)
 _PRICE_CACHE_TTL = 60    # seconds; quote endpoint is fast, don't over-call
 
+def _fetch_quote_yahoo(ticker):
+    """Yahoo's chart endpoint — no auth required, unlike the quote endpoint."""
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(ticker)}"
+           f"?interval=1d&range=5d&includePrePost=true")
+    req = Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept": "application/json",
+    })
+    with urlopen(req, timeout=8) as resp:
+        data = json.loads(resp.read())
+    chart = data.get("chart", {})
+    result = (chart.get("result") or [None])[0]
+    if not result:
+        return None
+    meta = result.get("meta", {}) or {}
+    price = meta.get("regularMarketPrice")
+    if price is None:
+        # Fall back to last close from indicators
+        closes = (result.get("indicators", {}).get("quote") or [{}])[0].get("close") or []
+        closes = [c for c in closes if c is not None]
+        if closes:
+            price = closes[-1]
+    prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+    if price is None or prev is None:
+        return None
+    change = price - prev
+    change_pct = (change / prev * 100) if prev else 0
+    return {"price": float(price), "change": float(change),
+            "change_pct": float(change_pct), "prev_close": float(prev),
+            "source": "Yahoo"}
+
+def _fetch_quote_stooq(ticker):
+    """Stooq CSV fallback. No auth, returns delayed data. US tickers get .us suffix."""
+    sym = ticker.lower()
+    if "." not in sym and "-" not in sym:
+        sym = f"{sym}.us"
+    url = f"https://stooq.com/q/l/?s={quote_plus(sym)}&f=sd2t2ohlcv&h&e=csv"
+    req = Request(url, headers={"User-Agent": USER_AGENT})
+    with urlopen(req, timeout=8) as resp:
+        text = resp.read().decode("utf-8", errors="replace")
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if len(lines) < 2:
+        return None
+    # Header: Symbol,Date,Time,Open,High,Low,Close,Volume
+    parts = lines[1].split(",")
+    if len(parts) < 7:
+        return None
+    try:
+        close = float(parts[6])
+        opn = float(parts[3])
+    except ValueError:
+        return None
+    if close <= 0:
+        return None
+    change = close - opn
+    change_pct = (change / opn * 100) if opn else 0
+    return {"price": close, "change": change, "change_pct": change_pct,
+            "prev_close": opn, "source": "Stooq"}
+
 def fetch_quote(ticker):
     """
-    Returns {'price': float, 'change': float, 'change_pct': float, 'prev_close': float}
-    or None if unavailable. Cached for 60s.
+    Returns {'price': float, 'change': float, 'change_pct': float, 'prev_close': float, 'source': str}
+    or None if unavailable. Cached for 60s. Tries Yahoo first, falls back to Stooq.
     """
+    if not ticker:
+        return None
     now = datetime.now(timezone.utc).timestamp()
     cached = _PRICE_CACHE.get(ticker)
     if cached and (now - cached[0] < _PRICE_CACHE_TTL):
         return cached[1]
 
-    try:
-        # Yahoo's quote endpoint, no key required
-        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={quote_plus(ticker)}"
-        req = Request(url, headers={"User-Agent": USER_AGENT})
-        with urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read())
-        results = data.get("quoteResponse", {}).get("result", [])
-        if not results:
-            return None
-        q = results[0]
-        price = q.get("regularMarketPrice") or q.get("preMarketPrice") or q.get("postMarketPrice")
-        prev = q.get("regularMarketPreviousClose") or q.get("previousClose")
-        if price is None or prev is None:
-            return None
-        change = price - prev
-        change_pct = (change / prev * 100) if prev else 0
-        out = {"price": float(price), "change": float(change),
-               "change_pct": float(change_pct), "prev_close": float(prev)}
-        _PRICE_CACHE[ticker] = (now, out)
-        return out
-    except (HTTPError, URLError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-        LOGGER.debug(f"Quote fetch failed for {ticker}: {e}")
-        return None
-    except Exception as e:
-        LOGGER.warning(f"Unexpected quote error for {ticker}: {e}")
-        return None
+    # Try Yahoo first
+    for fetcher_name, fetcher in (("Yahoo", _fetch_quote_yahoo), ("Stooq", _fetch_quote_stooq)):
+        try:
+            result = fetcher(ticker)
+            if result and result.get("price"):
+                _PRICE_CACHE[ticker] = (now, result)
+                return result
+        except (HTTPError, URLError) as e:
+            LOGGER.debug(f"{fetcher_name} quote failed for {ticker}: {e}")
+        except Exception as e:
+            LOGGER.debug(f"{fetcher_name} quote error for {ticker}: {e}")
+
+    # Cache the failure briefly so we don't hammer dead endpoints
+    _PRICE_CACHE[ticker] = (now, None)
+    return None
 
 # ───────────────────────────── STORY DATABASE ─────────────────────────────────
 
@@ -1169,11 +1220,15 @@ class StoryDetailWindow(tk.Toplevel):
 # ─────────────────────────── STORY CARD ───────────────────────────────────────
 
 class StoryCard(tk.Frame):
-    def __init__(self, master, story, on_click, **kw):
+    def __init__(self, master, story, on_click, on_pin=None, watchlist=None,
+                 show_outcome=False, **kw):
         super().__init__(master, bg=PALETTE["panel"], bd=0, highlightthickness=1,
                          highlightbackground=PALETTE["border_soft"], **kw)
         self.story = story
         self.on_click = on_click
+        self.on_pin = on_pin
+        self.watchlist = watchlist or set()
+        self.show_outcome = show_outcome
         self._build()
         self._bind_click(self)
 
@@ -1182,7 +1237,9 @@ class StoryCard(tk.Frame):
         widget.bind("<Enter>", self._on_enter)
         widget.bind("<Leave>", self._on_leave)
         for child in widget.winfo_children():
-            self._bind_click(child)
+            # Don't override interactive widgets that have their own bindings
+            if not isinstance(child, (tk.Button,)):
+                self._bind_click(child)
 
     def _on_enter(self, _e):
         self.config(highlightbackground=PALETTE["accent"])
@@ -1253,6 +1310,10 @@ class StoryCard(tk.Frame):
                      anchor="w", justify="left", wraplength=720
                      ).pack(fill="x", padx=14, pady=(0, 8))
 
+        # Outcome row — only in Outcomes view, shows price-since-headline async
+        if self.show_outcome and s.get("tickers"):
+            self._build_outcome_row(content, s)
+
         # Score bar
         bar_bg = tk.Frame(content, bg=PALETTE["score_bg"], height=4)
         bar_bg.pack(fill="x", padx=14, pady=(0, 8))
@@ -1281,7 +1342,7 @@ class StoryCard(tk.Frame):
 
         bar_bg.bind("<Configure>", _schedule_bar)
 
-        # Bottom: tickers + tags + watch
+        # Bottom: tickers + tags + actions
         bot = tk.Frame(content, bg=PALETTE["panel"])
         bot.pack(fill="x", padx=14, pady=(0, 12))
 
@@ -1294,15 +1355,134 @@ class StoryCard(tk.Frame):
             tk.Label(bot, text=f" {cat} ", bg=color, fg="#0a0e1c",
                      font=(FONT_DISPLAY, 8, "bold")
                      ).pack(side="left", padx=(0, 5))
+
+        # Right side: watchlist badge + pin button + click hint
         if s.get("watch_match"):
             tk.Label(bot, text="  ★ WATCHLIST  ", bg=PALETTE["warn"],
                      fg="#0a0e1c", font=(FONT_DISPLAY, 8, "bold")
-                     ).pack(side="right")
+                     ).pack(side="right", padx=(4, 0))
+
+        # Pin to watchlist button — only show if there are tickers to pin AND on_pin is wired
+        if s.get("tickers") and self.on_pin:
+            tickers_to_pin = set(s["tickers"][:3])
+            pin_already = bool(tickers_to_pin) and tickers_to_pin.issubset(self.watchlist)
+            btn_text = "✓ Pinned" if pin_already else "📌 Pin Tickers"
+            btn_bg = PALETTE["panel_alt"] if pin_already else PALETTE["accent"]
+            btn_fg = PALETTE["text_mute"] if pin_already else "#0a0e1c"
+            pin_btn = tk.Button(bot, text=btn_text,
+                bg=btn_bg, fg=btn_fg,
+                font=(FONT_DISPLAY, 8, "bold"),
+                bd=0, relief="flat", cursor="hand2",
+                activebackground=PALETTE["accent_hi"],
+                command=self._handle_pin, padx=8, pady=3)
+            pin_btn.pack(side="right", padx=(0, 6))
 
         # "View details" hint
         tk.Label(bot, text="Click for details →", bg=PALETTE["panel"],
                  fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 8, "italic")
                  ).pack(side="right", padx=(0, 10))
+
+    def _handle_pin(self):
+        """Called when the user clicks the Pin button. Doesn't propagate to card click."""
+        if self.on_pin:
+            self.on_pin(self.story)
+
+    def _build_outcome_row(self, parent, s):
+        """A row showing 'Price at headline → Price now' for each ticker. Async."""
+        outcome_frame = tk.Frame(parent, bg=PALETTE["bg_alt"])
+        outcome_frame.pack(fill="x", padx=14, pady=(0, 8))
+
+        # The "review unlock" rule: results are only meaningful after market opens.
+        # Show "Locked" badge if it's still pre-market or earlier the same day.
+        story_published = s.get("published")
+        if story_published and story_published.tzinfo is None:
+            story_published = story_published.replace(tzinfo=timezone.utc)
+
+        now_et = datetime.now(ET_ZONE)
+        # Review is "unlocked" if at least one full market open (9:30 AM ET) has elapsed since publication
+        review_unlocked = True
+        if story_published:
+            pub_et = story_published.astimezone(ET_ZONE)
+            # Unlock if today's date is after pub date AND it's past 11:30 AM ET on review day
+            same_day = pub_et.date() == now_et.date()
+            if same_day and now_et.hour < 11:
+                review_unlocked = False
+
+        header_row = tk.Frame(outcome_frame, bg=PALETTE["bg_alt"])
+        header_row.pack(fill="x", padx=10, pady=(6, 2))
+        tk.Label(header_row, text="📊  OUTCOME REVIEW",
+                 bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
+                 font=(FONT_DISPLAY, 8, "bold")
+                 ).pack(side="left")
+
+        if not review_unlocked:
+            tk.Label(header_row, text="🔒 Available after 11:30 AM ET review window",
+                     bg=PALETTE["bg_alt"], fg=PALETTE["warn"],
+                     font=(FONT_DISPLAY, 8, "italic")
+                     ).pack(side="left", padx=(10, 0))
+            return
+
+        # Render one row per ticker, async-fill prices
+        for ticker in s["tickers"][:3]:
+            row = tk.Frame(outcome_frame, bg=PALETTE["bg_alt"])
+            row.pack(fill="x", padx=10, pady=2)
+
+            tk.Label(row, text=f"${ticker}", bg=PALETTE["bg_alt"],
+                     fg=PALETTE["text"], font=(FONT_DISPLAY, 10, "bold"),
+                     width=8, anchor="w").pack(side="left")
+
+            status = tk.Label(row, text="Loading review…",
+                              bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
+                              font=(FONT_DISPLAY, 9))
+            status.pack(side="left", padx=(8, 0))
+
+            self._async_load_outcome(s, ticker, status)
+
+        # Add a tiny bottom padding
+        tk.Frame(outcome_frame, bg=PALETTE["bg_alt"], height=4).pack(fill="x")
+
+    def _async_load_outcome(self, story, ticker, label_widget):
+        """Background fetch of headline-time + current price for one ticker."""
+        def worker():
+            story_id = story.get("db_id")
+            if not story_id:
+                # Try lookup via story_key
+                try:
+                    conn = db_connect()
+                    cur = conn.execute("SELECT id FROM stories WHERE story_key=?",
+                                       (story.get("story_key", ""),))
+                    row = cur.fetchone()
+                    conn.close()
+                    story_id = row[0] if row else None
+                except Exception:
+                    story_id = None
+            headline_info = db_get_headline_price(story_id, ticker) if story_id else None
+            current = fetch_quote(ticker)
+
+            def update():
+                try:
+                    if not current:
+                        label_widget.config(text="Current price unavailable", fg=PALETTE["text_mute"])
+                        return
+                    if not headline_info:
+                        label_widget.config(
+                            text=f"${current['price']:.2f} now  ·  No headline price recorded",
+                            fg=PALETTE["text_dim"])
+                        return
+                    hp = headline_info["price"]
+                    cp = current["price"]
+                    delta = cp - hp
+                    delta_pct = (delta / hp * 100) if hp else 0
+                    color = PALETTE["accent_2"] if delta_pct >= 0 else PALETTE["danger"]
+                    sign = "+" if delta_pct >= 0 else ""
+                    label_widget.config(
+                        text=f"${hp:.2f} → ${cp:.2f}     {sign}{delta_pct:.2f}%   ({sign}${delta:.2f})",
+                        fg=color, font=(FONT_DISPLAY, 10, "bold"))
+                except tk.TclError:
+                    pass
+            label_widget.after(0, update)
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 # ─────────────────────────── MAIN WINDOW ──────────────────────────────────────
@@ -1533,17 +1713,38 @@ class PreMarketScanner(tk.Tk):
         main = tk.Frame(parent, bg=PALETTE["bg"])
         main.pack(side="right", fill="both", expand=True)
 
+        # Tabs row
         top = tk.Frame(main, bg=PALETTE["bg"])
-        top.pack(fill="x", padx=24, pady=(18, 10))
-        tk.Label(top, text="Top Stories", bg=PALETTE["bg"],
-                 fg=PALETTE["text"], font=(FONT_DISPLAY, 15, "bold")
-                 ).pack(side="left")
-        tk.Label(top, text="     Click any story for full details, score breakdown, and research links.",
+        top.pack(fill="x", padx=24, pady=(18, 0))
+
+        self.view_mode = tk.StringVar(value="live")
+
+        self.tab_live_btn = tk.Button(top, text="📰  LIVE STORIES",
+            bg=PALETTE["accent"], fg="#0a0e1c",
+            font=(FONT_DISPLAY, 11, "bold"), bd=0, relief="flat",
+            cursor="hand2", activebackground=PALETTE["accent_hi"],
+            command=lambda: self._set_view("live"),
+            padx=14, pady=8)
+        self.tab_live_btn.pack(side="left", padx=(0, 4))
+
+        self.tab_outcomes_btn = tk.Button(top, text="📊  OUTCOMES",
+            bg=PALETTE["panel"], fg=PALETTE["text_dim"],
+            font=(FONT_DISPLAY, 11, "bold"), bd=0, relief="flat",
+            cursor="hand2", activebackground=PALETTE["panel_hover"],
+            command=lambda: self._set_view("outcomes"),
+            padx=14, pady=8)
+        self.tab_outcomes_btn.pack(side="left", padx=(0, 4))
+
+        self.view_hint = tk.Label(top, text="   Click any story for details · pin tickers to your watchlist",
                  bg=PALETTE["bg"], fg=PALETTE["text_mute"],
-                 font=(FONT_DISPLAY, 9)).pack(side="left", pady=(4, 0))
+                 font=(FONT_DISPLAY, 9))
+        self.view_hint.pack(side="left", pady=(6, 0))
+
+        # Divider line beneath tabs
+        tk.Frame(main, bg=PALETTE["border"], height=1).pack(fill="x", padx=24, pady=(10, 0))
 
         list_frame = tk.Frame(main, bg=PALETTE["bg"])
-        list_frame.pack(fill="both", expand=True, padx=18, pady=(0, 14))
+        list_frame.pack(fill="both", expand=True, padx=18, pady=(10, 14))
 
         self.canvas = tk.Canvas(list_frame, bg=PALETTE["bg"], highlightthickness=0)
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.canvas.yview)
@@ -1623,9 +1824,16 @@ class PreMarketScanner(tk.Tk):
         min_score = int(self.min_score.get())
         only_watch = self.show_only_watchlist.get()
         cats = self.active_categories
+        view = self.view_mode.get() if hasattr(self, "view_mode") else "live"
 
         filtered = []
         for s in self.stories:
+            # Outcomes view: only show persisted stories that have tickers (so review makes sense)
+            if view == "outcomes":
+                if not s.get("persisted"):
+                    continue
+                if not s.get("tickers"):
+                    continue
             if s["score"] < min_score:
                 continue
             s_cats = set(s.get("catalysts", []))
@@ -1635,11 +1843,15 @@ class PreMarketScanner(tk.Tk):
                 continue
             filtered.append(s)
 
-        filtered.sort(key=lambda x: (
-            not x.get("watch_match", False),
-            -x["score"],
-            -(x["published"].timestamp() if x.get("published") else 0),
-        ))
+        if view == "outcomes":
+            # Sort by published date — newest first — so latest catalysts are reviewed first
+            filtered.sort(key=lambda x: -(x["published"].timestamp() if x.get("published") else 0))
+        else:
+            filtered.sort(key=lambda x: (
+                not x.get("watch_match", False),
+                -x["score"],
+                -(x["published"].timestamp() if x.get("published") else 0),
+            ))
         self.filtered = filtered
         self._render_cards()
 
@@ -1647,21 +1859,63 @@ class PreMarketScanner(tk.Tk):
         for child in self.cards_frame.winfo_children():
             child.destroy()
 
+        view = self.view_mode.get() if hasattr(self, "view_mode") else "live"
+
         if not self.filtered:
-            tk.Label(self.cards_frame,
-                text="\n\n\n No stories match your filters.\n Try lowering the bull score or expanding categories.\n",
+            empty_msg = (
+                "\n\n\n No tracked outcomes yet.\n "
+                "Stories with score 30+ get their headline prices saved.\n "
+                "Check back later to see how they played out.\n"
+                if view == "outcomes"
+                else "\n\n\n No stories match your filters.\n Try lowering the bull score or expanding categories.\n"
+            )
+            tk.Label(self.cards_frame, text=empty_msg,
                 bg=PALETTE["bg"], fg=PALETTE["text_mute"],
                 font=(FONT_DISPLAY, 11), justify="center"
                 ).pack(pady=40)
         else:
             for s in self.filtered[:MAX_STORIES]:
-                StoryCard(self.cards_frame, s, on_click=self._on_card_click
+                StoryCard(self.cards_frame, s,
+                          on_click=self._on_card_click,
+                          on_pin=self._pin_story_tickers,
+                          watchlist=self.watchlist,
+                          show_outcome=(view == "outcomes")
                           ).pack(fill="x", padx=6, pady=4)
 
+        view_label = "outcomes" if view == "outcomes" else "stories"
         self.count_lbl.config(
-            text=f"Showing {len(self.filtered)} of {len(self.stories)} stories  "
+            text=f"Showing {len(self.filtered)} {view_label}  "
         )
         self.canvas.yview_moveto(0)
+
+    def _pin_story_tickers(self, story):
+        """Add this story's tickers to the watchlist."""
+        new_tickers = set(story.get("tickers", [])[:3])
+        if not new_tickers:
+            return
+        added = new_tickers - self.watchlist
+        self.watchlist |= new_tickers
+        # Refresh the entry box
+        self.watch_entry.delete(0, tk.END)
+        self.watch_entry.insert(0, ", ".join(sorted(self.watchlist)))
+        self._rescore_watch_matches()
+        self._apply_filters()
+        self._save_settings()
+        if added:
+            LOGGER.info(f"PINNED to watchlist: {','.join(sorted(added))}")
+
+    def _set_view(self, mode):
+        """Switch between 'live' and 'outcomes' views."""
+        self.view_mode.set(mode)
+        if mode == "live":
+            self.tab_live_btn.config(bg=PALETTE["accent"], fg="#0a0e1c")
+            self.tab_outcomes_btn.config(bg=PALETTE["panel"], fg=PALETTE["text_dim"])
+            self.view_hint.config(text="   Click any story for details · pin tickers to your watchlist")
+        else:
+            self.tab_live_btn.config(bg=PALETTE["panel"], fg=PALETTE["text_dim"])
+            self.tab_outcomes_btn.config(bg=PALETTE["accent"], fg="#0a0e1c")
+            self.view_hint.config(text="   Tracked stories with price-since-headline. Review after market open.")
+        self._apply_filters()
 
     def _on_card_click(self, story):
         LOGGER.info(
