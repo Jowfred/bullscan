@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.3.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -1107,7 +1107,7 @@ def resolve_company_to_ticker(name):
     if name_key in _NAME_LOOKUP_CACHE:
         return _NAME_LOOKUP_CACHE[name_key]
     try:
-        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={quote_plus(name)}&quotesCount=3&newsCount=0"
+        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={quote_plus(name)}&quotesCount=5&newsCount=0"
         req = Request(url, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "application/json",
@@ -1115,20 +1115,39 @@ def resolve_company_to_ticker(name):
         with urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
         quotes = data.get("quotes") or []
-        # Prefer US-listed equities
+
+        def _looks_like_variant(s):
+            # Same detector as the main module, inlined to avoid forward-ref issues
+            return bool(re.search(r"(?:[-.]P[A-Z]?$|[-.]PR[A-Z]?$|[-.]W[ST]?$|[-./]U$|[-./]R$)", s))
+
+        us_exch = ("NMS", "NYQ", "NGM", "PCX", "ASE", "BATS")
+
+        # Pass 1: US-listed, EQUITY, NOT a preferred/warrant variant
         for q in quotes:
             if q.get("quoteType") != "EQUITY":
                 continue
             exch = (q.get("exchange") or "").upper()
-            if exch in ("NMS", "NYQ", "NGM", "PCX", "ASE", "BATS"):  # US exchanges
-                tkr = q.get("symbol", "").upper()
-                if tkr and "." not in tkr:  # avoid foreign listings like BABA.HK
-                    _NAME_LOOKUP_CACHE[name_key] = tkr
-                    return tkr
-        # Fallback: first equity result of any exchange
+            tkr = (q.get("symbol") or "").upper()
+            if not tkr or "." in tkr:
+                continue
+            if exch in us_exch and not _looks_like_variant(tkr):
+                _NAME_LOOKUP_CACHE[name_key] = tkr
+                return tkr
+
+        # Pass 2: US-listed, EQUITY, any (preferred OK as fallback)
+        for q in quotes:
+            if q.get("quoteType") != "EQUITY":
+                continue
+            exch = (q.get("exchange") or "").upper()
+            tkr = (q.get("symbol") or "").upper()
+            if tkr and "." not in tkr and exch in us_exch:
+                _NAME_LOOKUP_CACHE[name_key] = tkr
+                return tkr
+
+        # Pass 3: anything that's an EQUITY at all
         for q in quotes:
             if q.get("quoteType") == "EQUITY":
-                tkr = q.get("symbol", "").upper()
+                tkr = (q.get("symbol") or "").upper()
                 if tkr:
                     _NAME_LOOKUP_CACHE[name_key] = tkr
                     return tkr
@@ -1281,7 +1300,50 @@ def extract_tickers(text, allow_network=True):
                 if len(found) >= 3:
                     break
 
+    # ─── Post-processing: collapse non-common-stock variants ─────────────────
+    # When a story has both the common stock (e.g. TRTX) and a preferred series
+    # or warrant of the same issuer (TRTX-P, TRTX.PR, TRTX-WT), keep only the
+    # common stock. Investors mostly care about common shares; preferreds and
+    # warrants are separate securities that mostly confuse the display.
+    found = _filter_to_common_stock(found)
+
     return found[:6]
+
+
+def _is_non_common_variant(ticker):
+    """True if ticker looks like a preferred share, warrant, unit, right, etc.
+    Common stocks are plain 1-5 letters. Variants have suffixes like:
+      -P, -PA..-PE          (preferred series)
+      .PR, .PRA..PRZ        (Yahoo's preferred-suffix convention)
+      -WT, .WS, /WS         (warrants)
+      -U, .U                (units)
+      -R, .R                (rights)
+    """
+    return bool(re.search(
+        r"(?:[-.]P[A-Z]?$|[-.]PR[A-Z]?$|[-.]W[ST]?$|[-./]U$|[-./]R$)",
+        ticker,
+        re.IGNORECASE,
+    ))
+
+def _base_symbol(ticker):
+    """Strip variant suffixes to get the underlying common-stock symbol."""
+    return re.sub(r"[-./].*$", "", ticker)
+
+def _filter_to_common_stock(tickers):
+    """Drop preferred/warrant/unit variants when the common stock is in the list.
+    Also drop pure variants (no common stock found) only if they look unusable.
+    Preserves order."""
+    common_bases = {_base_symbol(t) for t in tickers if not _is_non_common_variant(t)}
+    out = []
+    seen = set()
+    for t in tickers:
+        if _is_non_common_variant(t) and _base_symbol(t) in common_bases:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
 
 # ───────────────────────────── SCORING ────────────────────────────────────────
 
