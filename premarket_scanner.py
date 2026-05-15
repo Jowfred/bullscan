@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "2.9.1"
+APP_VERSION = "3.0.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -295,6 +295,16 @@ def is_premarket_now():
     start = now_et.replace(hour=4, minute=0, second=0, microsecond=0)
     end = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     return start <= now_et <= end
+
+def _market_open_passed_today():
+    """True if it's a weekday and at least 9:30 AM ET has passed today.
+    Used to decide whether previous-session stories should be dropped."""
+    now_et = datetime.now(ET_ZONE)
+    if now_et.weekday() >= 5:
+        # Weekend: market hasn't opened today; we consider prior weekday's open as the cutoff
+        return True
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    return now_et >= market_open
 
 # ───────────────────────────── PRICE FETCHING ─────────────────────────────────
 # Uses Yahoo Finance's public quote endpoint. Free, may be slightly delayed.
@@ -2263,15 +2273,15 @@ class PreMarketScanner(tk.Tk):
             padx=14, pady=8)
         self.tab_live_btn.pack(side="left", padx=(0, 4))
 
-        self.tab_outcomes_btn = tk.Button(top, text="📊  OUTCOMES",
+        self.tab_watchlist_btn = tk.Button(top, text="📌  WATCHLIST",
             bg=PALETTE["panel"], fg=PALETTE["text_dim"],
             font=(FONT_DISPLAY, 11, "bold"), bd=0, relief="flat",
             cursor="hand2", activebackground=PALETTE["panel_hover"],
-            command=lambda: self._set_view("outcomes"),
+            command=lambda: self._set_view("watchlist"),
             padx=14, pady=8)
-        self.tab_outcomes_btn.pack(side="left", padx=(0, 4))
+        self.tab_watchlist_btn.pack(side="left", padx=(0, 4))
 
-        self.view_hint = tk.Label(top, text="   Click any story for details · pin tickers to your watchlist",
+        self.view_hint = tk.Label(top, text="   Click any story for details · pin stories you want to track",
                  bg=PALETTE["bg"], fg=PALETTE["text_mute"],
                  font=(FONT_DISPLAY, 9))
         self.view_hint.pack(side="left", pady=(6, 0))
@@ -2364,12 +2374,17 @@ class PreMarketScanner(tk.Tk):
 
         filtered = []
         for s in self.stories:
-            # Outcomes view: only show persisted stories that have tickers (so review makes sense)
-            if view == "outcomes":
-                if not s.get("persisted"):
+            # Watchlist view: pinned stories + watchlist-ticker matches.
+            # Bypass score/category/min-score filters here.
+            if view == "watchlist":
+                is_pinned = s.get("story_key", "") in self.pinned_stories
+                is_watch_match = s.get("watch_match", False)
+                if not (is_pinned or is_watch_match):
                     continue
-                if not s.get("tickers"):
-                    continue
+                filtered.append(s)
+                continue
+
+            # Live view: apply all the normal filters
             if s["score"] < min_score:
                 continue
             s_cats = set(s.get("catalysts", []))
@@ -2379,9 +2394,12 @@ class PreMarketScanner(tk.Tk):
                 continue
             filtered.append(s)
 
-        if view == "outcomes":
-            # Sort by published date — newest first — so latest catalysts are reviewed first
-            filtered.sort(key=lambda x: -(x["published"].timestamp() if x.get("published") else 0))
+        if view == "watchlist":
+            # Pinned first, then watchlist-only matches, then by recency
+            filtered.sort(key=lambda x: (
+                x.get("story_key", "") not in self.pinned_stories,  # pinned first
+                -(x["published"].timestamp() if x.get("published") else 0),
+            ))
         else:
             filtered.sort(key=lambda x: (
                 not x.get("watch_match", False),
@@ -2396,16 +2414,20 @@ class PreMarketScanner(tk.Tk):
             child.destroy()
 
         view = self.view_mode.get() if hasattr(self, "view_mode") else "live"
-        self._rendered_cards = []  # keep references for pin-button updates
+        self._rendered_cards = []
 
         if not self.filtered:
-            empty_msg = (
-                "\n\n\n No tracked outcomes yet.\n "
-                "Stories with score 30+ get their headline prices saved.\n "
-                "Check back later to see how they played out.\n"
-                if view == "outcomes"
-                else "\n\n\n No stories match your filters.\n Try lowering the bull score or expanding categories.\n"
-            )
+            if view == "watchlist":
+                empty_msg = (
+                    "\n\n\n No pinned stories or watchlist matches yet.\n "
+                    "Click the 📌 Pin button on any story to track it here.\n "
+                    "Add tickers to your watchlist in the sidebar to follow them too.\n"
+                )
+            else:
+                empty_msg = (
+                    "\n\n\n No stories match your filters.\n "
+                    "Try lowering the bull score or expanding categories.\n"
+                )
             tk.Label(self.cards_frame, text=empty_msg,
                 bg=PALETTE["bg"], fg=PALETTE["text_mute"],
                 font=(FONT_DISPLAY, 11), justify="center"
@@ -2417,11 +2439,11 @@ class PreMarketScanner(tk.Tk):
                           on_pin=self._pin_story_tickers,
                           watchlist=self.watchlist,
                           pinned_keys=self.pinned_stories,
-                          show_outcome=(view == "outcomes"))
+                          show_outcome=(view == "watchlist"))
                 card.pack(fill="x", padx=6, pady=4)
                 self._rendered_cards.append(card)
 
-        view_label = "outcomes" if view == "outcomes" else "stories"
+        view_label = "pinned" if view == "watchlist" else "stories"
         self.count_lbl.config(
             text=f"Showing {len(self.filtered)} {view_label}  "
         )
@@ -2479,16 +2501,16 @@ class PreMarketScanner(tk.Tk):
                 pass
 
     def _set_view(self, mode):
-        """Switch between 'live' and 'outcomes' views."""
+        """Switch between 'live' and 'watchlist' views."""
         self.view_mode.set(mode)
         if mode == "live":
             self.tab_live_btn.config(bg=PALETTE["accent"], fg="#0a0e1c")
-            self.tab_outcomes_btn.config(bg=PALETTE["panel"], fg=PALETTE["text_dim"])
-            self.view_hint.config(text="   Click any story for details · pin tickers to your watchlist")
+            self.tab_watchlist_btn.config(bg=PALETTE["panel"], fg=PALETTE["text_dim"])
+            self.view_hint.config(text="   Click any story for details · pin stories you want to track")
         else:
             self.tab_live_btn.config(bg=PALETTE["panel"], fg=PALETTE["text_dim"])
-            self.tab_outcomes_btn.config(bg=PALETTE["accent"], fg="#0a0e1c")
-            self.view_hint.config(text="   Tracked stories with price-since-headline. Review after market open.")
+            self.tab_watchlist_btn.config(bg=PALETTE["accent"], fg="#0a0e1c")
+            self.view_hint.config(text="   Stories you've pinned + tickers you're tracking. Click a story for outcome details.")
         self._apply_filters()
 
     def _on_card_click(self, story):
@@ -2567,6 +2589,11 @@ class PreMarketScanner(tk.Tk):
                 self.fetch_queue.put(("progress", (done, total, source)))
             stories = fetch_all_feeds(progress_cb=prog)
             stories = dedupe_stories(stories)
+
+            # Capture pinned story keys at the start of this fetch so the worker
+            # can safely use them off the main thread.
+            pinned_keys_snapshot = set(self.pinned_stories)
+
             for s in stories:
                 score, cats, breakdown = score_story(s["title"], s.get("summary", ""))
                 s["score"] = score
@@ -2575,14 +2602,16 @@ class PreMarketScanner(tk.Tk):
                 s["tickers"] = extract_tickers(f"{s['title']} {s.get('summary', '')}")
                 s["watch_match"] = bool(self.watchlist & set(s["tickers"]))
                 s["story_key"] = re.sub(r"[^a-z0-9]+", "", s["title"].lower())[:120]
+                s["pinned"] = s["story_key"] in pinned_keys_snapshot
 
-                # Persist high-scoring stories + capture headline-time prices
-                if score >= PERSIST_MIN_SCORE:
+                # Persist if: high-scoring OR user has pinned this story.
+                # Pinned stories should never be lost even if score is 0.
+                should_persist = (score >= PERSIST_MIN_SCORE) or s["pinned"]
+                if should_persist:
                     story_id = db_save_story(s)
                     s["db_id"] = story_id
                     if story_id and s["tickers"]:
-                        for t in s["tickers"][:3]:  # cap to first 3 tickers
-                            # Only capture once per (story, ticker)
+                        for t in s["tickers"][:3]:
                             existing = db_get_headline_price(story_id, t)
                             if existing is None:
                                 q = fetch_quote(t)
@@ -2594,15 +2623,30 @@ class PreMarketScanner(tk.Tk):
                 reverse=True
             )
 
-            # Merge with persisted stories from this and previous session
-            persisted = db_load_stories(days_back=2)
+            # Merge with persisted stories so we don't lose pinned ones that have
+            # since fallen off the RSS feeds.
+            persisted = db_load_stories(days_back=7)  # load up to a week for pinned
             new_keys = {s["story_key"] for s in stories}
+            current_session = session_date_for(datetime.now(timezone.utc))
+            today_market_open_passed = _market_open_passed_today()
+
             for p in persisted:
-                if p["story_key"] not in new_keys:
-                    # Add persisted-only stories so user can see yesterday's catalysts
-                    p["breakdown"] = []  # not stored, fine
-                    p["watch_match"] = bool(self.watchlist & set(p.get("tickers", [])))
-                    stories.append(p)
+                if p["story_key"] in new_keys:
+                    continue
+                is_pinned = p["story_key"] in pinned_keys_snapshot
+
+                # Apply the "remove old stories after next market open" rule:
+                # - If pinned: always keep
+                # - If from current session: keep
+                # - If from a previous session AND today's market open has passed: drop
+                if not is_pinned:
+                    if p.get("session_date") != current_session and today_market_open_passed:
+                        continue
+
+                p["breakdown"] = []
+                p["watch_match"] = bool(self.watchlist & set(p.get("tickers", [])))
+                p["pinned"] = is_pinned
+                stories.append(p)
 
             self.fetch_queue.put(("done", stories))
         except Exception as e:
