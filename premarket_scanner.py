@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.4.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -377,6 +377,163 @@ def _fetch_quote_yahoo(ticker):
     return {"price": float(price), "change": float(change),
             "change_pct": float(change_pct), "prev_close": float(prev),
             "source": "Yahoo"}
+
+# ─── Daily-performance fetcher (used by Daily Summary section) ────────────────
+# Returns intraday data for ONE trading day at minute granularity. Used after
+# market close to build the daily performance summary for pinned stories.
+
+_DAILY_PERF_CACHE = {}  # (ticker, date_iso) -> (timestamp, data dict)
+_DAILY_PERF_TTL = 300   # 5 minutes
+
+def fetch_daily_performance(ticker):
+    """
+    Fetch intraday minute-level data for the most recent trading day.
+    Returns dict with: price, prev_close, high, low, open, volume, avg_volume_30d,
+                       peak_time, peak_pct, trough_time, trough_pct.
+    Returns None on failure. Cached for 5 minutes.
+    """
+    if not ticker:
+        return None
+    now_ts = datetime.now(timezone.utc).timestamp()
+    today_key = datetime.now(ET_ZONE).strftime("%Y-%m-%d")
+    cache_key = (ticker, today_key)
+    cached = _DAILY_PERF_CACHE.get(cache_key)
+    if cached and (now_ts - cached[0] < _DAILY_PERF_TTL):
+        return cached[1]
+
+    try:
+        # Get 1-minute candles for the most recent trading day
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(ticker)}"
+               f"?interval=1m&range=1d&includePrePost=false")
+        req = Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "Accept": "application/json",
+        })
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+
+        result = (data.get("chart", {}).get("result") or [None])[0]
+        if not result:
+            return None
+        meta = result.get("meta", {}) or {}
+        timestamps = result.get("timestamp") or []
+        quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+
+        closes = quote.get("close") or []
+        highs = quote.get("high") or []
+        lows = quote.get("low") or []
+        opens = quote.get("open") or []
+        volumes = quote.get("volume") or []
+
+        # Filter out null bars
+        candles = []
+        for i, ts in enumerate(timestamps):
+            if i >= len(closes):
+                break
+            c = closes[i] if i < len(closes) else None
+            if c is None:
+                continue
+            candles.append({
+                "ts": ts,
+                "close": c,
+                "high": highs[i] if i < len(highs) and highs[i] is not None else c,
+                "low": lows[i] if i < len(lows) and lows[i] is not None else c,
+                "volume": volumes[i] if i < len(volumes) and volumes[i] is not None else 0,
+            })
+
+        if not candles:
+            return None
+
+        prev_close = (meta.get("chartPreviousClose")
+                      or meta.get("previousClose"))
+        if prev_close is None:
+            return None
+        prev_close = float(prev_close)
+
+        # Compute summary stats
+        last_price = candles[-1]["close"]
+        day_open = candles[0].get("close")  # first traded price
+        for c in candles:
+            if c.get("close"):
+                day_open = c["close"]
+                break
+
+        day_high = max(c["high"] for c in candles)
+        day_low = min(c["low"] for c in candles)
+        total_volume = sum(c.get("volume", 0) for c in candles)
+
+        # Find peak and trough relative to prev_close
+        peak_candle = max(candles, key=lambda c: c["high"])
+        trough_candle = min(candles, key=lambda c: c["low"])
+
+        peak_pct = ((peak_candle["high"] - prev_close) / prev_close * 100) if prev_close else 0
+        trough_pct = ((trough_candle["low"] - prev_close) / prev_close * 100) if prev_close else 0
+
+        peak_time = datetime.fromtimestamp(peak_candle["ts"], ET_ZONE).strftime("%I:%M %p ET")
+        trough_time = datetime.fromtimestamp(trough_candle["ts"], ET_ZONE).strftime("%I:%M %p ET")
+
+        # Fetch 30-day avg volume from the 5d-daily quote (separate small call)
+        avg_volume_30d = None
+        try:
+            avg_url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(ticker)}"
+                       f"?interval=1d&range=3mo")
+            req2 = Request(avg_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+            })
+            with urlopen(req2, timeout=8) as resp2:
+                avg_data = json.loads(resp2.read())
+            avg_quote = (avg_data.get("chart", {}).get("result", [{}])[0]
+                                  .get("indicators", {}).get("quote") or [{}])[0]
+            avg_vols = [v for v in (avg_quote.get("volume") or []) if v]
+            if len(avg_vols) >= 20:
+                avg_volume_30d = sum(avg_vols[-30:]) / min(30, len(avg_vols[-30:]))
+        except Exception as e:
+            LOGGER.debug(f"avg volume fetch failed for {ticker}: {e}")
+
+        change = last_price - prev_close
+        change_pct = (change / prev_close * 100) if prev_close else 0
+
+        # Market state from meta (REGULAR / POSTPOST / PRE)
+        market_state = meta.get("marketState", "")
+
+        out = {
+            "price": float(last_price),
+            "prev_close": prev_close,
+            "open": float(day_open) if day_open else None,
+            "high": float(day_high),
+            "low": float(day_low),
+            "change": float(change),
+            "change_pct": float(change_pct),
+            "volume": int(total_volume),
+            "avg_volume_30d": float(avg_volume_30d) if avg_volume_30d else None,
+            "peak_pct": float(peak_pct),
+            "peak_time": peak_time,
+            "trough_pct": float(trough_pct),
+            "trough_time": trough_time,
+            "market_state": market_state,
+            "date": today_key,
+        }
+        _DAILY_PERF_CACHE[cache_key] = (now_ts, out)
+        return out
+
+    except (HTTPError, URLError) as e:
+        LOGGER.debug(f"daily perf fetch failed for {ticker}: {e}")
+        return None
+    except Exception as e:
+        LOGGER.warning(f"daily perf unexpected error for {ticker}: {e}")
+        return None
+
+def market_is_closed_for_today():
+    """True if the regular session has ended for today (4:00 PM ET) on a weekday,
+    OR if it's a weekend."""
+    now_et = datetime.now(ET_ZONE)
+    if now_et.weekday() >= 5:
+        return True  # weekend
+    close_time = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return now_et >= close_time
+
 
 def _fetch_quote_stooq(ticker):
     """Stooq CSV fallback. No auth, returns delayed data. US tickers get .us suffix."""
@@ -1663,6 +1820,18 @@ class StoryDetailPanel(tk.Frame):
                 font=(FONT_DISPLAY, 8), anchor="w", justify="left", wraplength=700
                 ).pack(fill="x", padx=24, pady=(4, 16))
 
+            # Daily Performance Summary — shown after market close
+            if market_is_closed_for_today():
+                self._section(body, "DAILY PERFORMANCE  ·  MARKET CLOSED")
+                for t in s["tickers"][:3]:
+                    self._daily_perf_card(body, t)
+                tk.Label(body,
+                    text="Factual end-of-day price data — no opinions, no predictions. "
+                         "Compare today's close to the headline price to see how the catalyst played out.",
+                    bg=PALETTE["bg"], fg=PALETTE["text_mute"],
+                    font=(FONT_DISPLAY, 8), anchor="w", justify="left", wraplength=700
+                    ).pack(fill="x", padx=24, pady=(4, 16))
+
         if s.get("catalysts"):
             self._section(body, "CATALYST TAGS")
             cat_wrap = tk.Frame(body, bg=PALETTE["bg"])
@@ -1852,6 +2021,158 @@ class StoryDetailPanel(tk.Frame):
                          cursor="hand2", padx=4, pady=4)
             b.pack(side="left", padx=(0, 4))
             b.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
+
+    def _daily_perf_card(self, parent, ticker):
+        """End-of-day performance summary for one ticker. Async fetch.
+        Pure facts: close, change-from-headline, intraday range, peak/trough, volume."""
+        card = tk.Frame(parent, bg=PALETTE["panel"],
+                        highlightthickness=1, highlightbackground=PALETTE["border"])
+        card.pack(fill="x", padx=24, pady=(0, 8))
+
+        # Header row with ticker
+        header = tk.Frame(card, bg=PALETTE["panel_alt"])
+        header.pack(fill="x")
+        tk.Label(header, text=f" ${ticker}  · DAILY SUMMARY ",
+                 bg=PALETTE["panel_alt"], fg=PALETTE["accent_hi"],
+                 font=(FONT_DISPLAY, 10, "bold"), padx=12, pady=8
+                 ).pack(side="left")
+        status_lbl = tk.Label(header, text=" Loading data… ",
+                              bg=PALETTE["panel_alt"], fg=PALETTE["text_mute"],
+                              font=(FONT_DISPLAY, 9, "italic"))
+        status_lbl.pack(side="right", padx=12)
+
+        # Body — populated async
+        body = tk.Frame(card, bg=PALETTE["panel"])
+        body.pack(fill="x", padx=14, pady=10)
+        loading_lbl = tk.Label(body, text="Fetching intraday data…",
+                               bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                               font=(FONT_DISPLAY, 9))
+        loading_lbl.pack(anchor="w")
+
+        def worker():
+            data = fetch_daily_performance(ticker)
+            # Also look up headline price if available
+            story_id = self.story.get("db_id") or self._find_story_id()
+            headline_info = db_get_headline_price(story_id, ticker) if story_id else None
+
+            def render():
+                try:
+                    loading_lbl.destroy()
+                    status_lbl.destroy()
+                except tk.TclError:
+                    return
+
+                if not data:
+                    tk.Label(body, text="Daily data unavailable for this ticker.",
+                             bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                             font=(FONT_DISPLAY, 9), anchor="w"
+                             ).pack(fill="x")
+                    return
+
+                # ─── Big number: close + change vs prev day ────────────
+                topline = tk.Frame(body, bg=PALETTE["panel"])
+                topline.pack(fill="x", pady=(0, 8))
+
+                close_color = PALETTE["accent_2"] if data["change_pct"] >= 0 else PALETTE["danger"]
+                close_sign = "+" if data["change_pct"] >= 0 else ""
+                tk.Label(topline, text=f"${data['price']:.2f}",
+                         bg=PALETTE["panel"], fg=PALETTE["text"],
+                         font=(FONT_DISPLAY, 18, "bold")
+                         ).pack(side="left")
+                tk.Label(topline,
+                         text=f"  {close_sign}{data['change_pct']:.2f}% vs yesterday's close",
+                         bg=PALETTE["panel"], fg=close_color,
+                         font=(FONT_DISPLAY, 11, "bold")
+                         ).pack(side="left", padx=(8, 0), pady=(6, 0))
+
+                # ─── Vs headline (if available) ─────────────────────────
+                if headline_info:
+                    hp = headline_info["price"]
+                    delta = data["price"] - hp
+                    delta_pct = (delta / hp * 100) if hp else 0
+                    color = PALETTE["accent_2"] if delta_pct >= 0 else PALETTE["danger"]
+                    sign = "+" if delta_pct >= 0 else ""
+                    try:
+                        captured = datetime.fromisoformat(headline_info["captured_at"])
+                        captured_str = captured.astimezone(ET_ZONE).strftime("%I:%M %p ET")
+                    except Exception:
+                        captured_str = "headline time"
+                    tk.Label(body,
+                        text=f"From headline price (${hp:.2f} @ {captured_str}):  "
+                             f"{sign}{delta_pct:.2f}%   ({sign}${delta:.2f})",
+                        bg=PALETTE["panel"], fg=color,
+                        font=(FONT_DISPLAY, 10, "bold"), anchor="w"
+                        ).pack(fill="x", pady=(0, 8))
+
+                # ─── Intraday stats grid ───────────────────────────────
+                grid = tk.Frame(body, bg=PALETTE["panel"])
+                grid.pack(fill="x", pady=(4, 0))
+
+                def stat(parent, label, value, value_color=None):
+                    cell = tk.Frame(parent, bg=PALETTE["panel_alt"])
+                    cell.pack(side="left", fill="both", expand=True, padx=(0, 4))
+                    tk.Label(cell, text=label, bg=PALETTE["panel_alt"],
+                             fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 8, "bold")
+                             ).pack(anchor="w", padx=8, pady=(6, 0))
+                    tk.Label(cell, text=value, bg=PALETTE["panel_alt"],
+                             fg=value_color or PALETTE["text"],
+                             font=(FONT_DISPLAY, 10, "bold")
+                             ).pack(anchor="w", padx=8, pady=(2, 6))
+
+                stat(grid, "OPEN", f"${data['open']:.2f}" if data.get("open") else "—")
+                stat(grid, "HIGH", f"${data['high']:.2f}", PALETTE["accent_2"])
+                stat(grid, "LOW", f"${data['low']:.2f}", PALETTE["danger"])
+                stat(grid, "CLOSE", f"${data['price']:.2f}")
+
+                # ─── Peak/trough timing ────────────────────────────────
+                peak_color = PALETTE["accent_2"] if data["peak_pct"] >= 0 else PALETTE["text_mute"]
+                trough_color = PALETTE["danger"] if data["trough_pct"] < 0 else PALETTE["text_mute"]
+                peak_sign = "+" if data["peak_pct"] >= 0 else ""
+                trough_sign = "+" if data["trough_pct"] >= 0 else ""
+
+                peak_row = tk.Frame(body, bg=PALETTE["panel"])
+                peak_row.pack(fill="x", pady=(8, 2))
+                tk.Label(peak_row, text="▲ Peak gain:", bg=PALETTE["panel"],
+                         fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 9), width=14, anchor="w"
+                         ).pack(side="left")
+                tk.Label(peak_row,
+                         text=f"{peak_sign}{data['peak_pct']:.2f}% at {data['peak_time']}",
+                         bg=PALETTE["panel"], fg=peak_color, font=(FONT_DISPLAY, 9, "bold")
+                         ).pack(side="left")
+
+                trough_row = tk.Frame(body, bg=PALETTE["panel"])
+                trough_row.pack(fill="x", pady=(0, 2))
+                tk.Label(trough_row, text="▼ Worst level:", bg=PALETTE["panel"],
+                         fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 9), width=14, anchor="w"
+                         ).pack(side="left")
+                tk.Label(trough_row,
+                         text=f"{trough_sign}{data['trough_pct']:.2f}% at {data['trough_time']}",
+                         bg=PALETTE["panel"], fg=trough_color, font=(FONT_DISPLAY, 9, "bold")
+                         ).pack(side="left")
+
+                # ─── Volume ────────────────────────────────────────────
+                vol_row = tk.Frame(body, bg=PALETTE["panel"])
+                vol_row.pack(fill="x", pady=(2, 0))
+                tk.Label(vol_row, text="Volume:", bg=PALETTE["panel"],
+                         fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 9), width=14, anchor="w"
+                         ).pack(side="left")
+                vol_text = f"{data['volume']:,}"
+                if data.get("avg_volume_30d"):
+                    multiple = data["volume"] / data["avg_volume_30d"]
+                    vol_text += f"   ({multiple:.1f}× the 30-day average)"
+                    vol_color = PALETTE["warn"] if multiple >= 2.0 else PALETTE["text"]
+                else:
+                    vol_color = PALETTE["text"]
+                tk.Label(vol_row, text=vol_text,
+                         bg=PALETTE["panel"], fg=vol_color, font=(FONT_DISPLAY, 9, "bold")
+                         ).pack(side="left")
+
+            try:
+                body.after(0, render)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _find_story_id(self):
         """Look up the story's DB id by story_key, if it exists."""
