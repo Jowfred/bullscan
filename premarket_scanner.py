@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.9.1"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -1879,14 +1879,13 @@ class StoryCard(tk.Frame):
                      fg="#0a0e1c", font=(FONT_DISPLAY, 8, "bold")
                      ).pack(side="right", padx=(4, 0))
 
-        # Pin button — always shown when on_pin is wired. Works for stories with or
-        # without tickers. Pinned state is based on either tickers in watchlist OR
-        # story_key in pinned_stories.
+        # Pin button — always shown when on_pin is wired. Pinned state depends
+        # ONLY on whether the user has bookmarked this specific story (story_key).
+        # Watchlist tickers are separate; pinning a story adds them but unpinning
+        # leaves them, since the user may want to keep tracking those tickers.
         if self.on_pin:
             story_key = s.get("story_key") or re.sub(r"[^a-z0-9]+", "", s.get("title", "").lower())[:120]
-            story_tickers = set(s.get("tickers", [])[:3])
-            pin_already = (story_key in self.pinned_keys) or \
-                          (bool(story_tickers) and story_tickers.issubset(self.watchlist))
+            pin_already = story_key in self.pinned_keys
             btn_text = "✓ Pinned" if pin_already else "📌 Pin"
             btn_bg = PALETTE["panel_alt"] if pin_already else PALETTE["accent"]
             btn_fg = PALETTE["text_mute"] if pin_already else "#0a0e1c"
@@ -2429,24 +2428,21 @@ class PreMarketScanner(tk.Tk):
         self.canvas.yview_moveto(0)
 
     def _pin_story_tickers(self, story):
-        """Pin/unpin a story. Adds tickers to watchlist (if any) AND bookmarks the story itself."""
+        """Pin/unpin a story. Adds tickers to watchlist when pinning. When unpinning,
+        only the story bookmark is removed — tickers stay in the watchlist since the
+        user may want to keep tracking them. Pinned state depends ONLY on story_key."""
         story_key = story.get("story_key", "")
         if not story_key:
             story_key = re.sub(r"[^a-z0-9]+", "", story.get("title", "").lower())[:120]
             story["story_key"] = story_key
 
+        is_currently_pinned = story_key in self.pinned_stories
         story_tickers = set(story.get("tickers", [])[:3])
-        is_currently_pinned = (story_key in self.pinned_stories) or \
-                              (story_tickers and story_tickers.issubset(self.watchlist))
 
         if is_currently_pinned:
-            # Unpin: remove story key + any tickers that came only from this story
             self.pinned_stories.discard(story_key)
-            # Don't remove tickers from watchlist automatically — user might want to keep
-            # tracking them after unbookmarking the story. Only the story_key is unbookmarked.
-            LOGGER.info(f"UNPINNED story: {story_key}")
+            LOGGER.info(f"UNPINNED story: {story.get('title','')[:60]}")
         else:
-            # Pin: bookmark the story, and add any tickers to watchlist
             self.pinned_stories.add(story_key)
             added_tickers = story_tickers - self.watchlist
             self.watchlist |= story_tickers
@@ -2460,8 +2456,6 @@ class PreMarketScanner(tk.Tk):
         self.watch_entry.insert(0, ", ".join(sorted(self.watchlist)))
         self._rescore_watch_matches()
         self._save_settings()
-        # Don't re-render whole list — just update this card's pin button state if possible.
-        # Cheaper than re-rendering all cards.
         self._refresh_pin_buttons()
 
     def _refresh_pin_buttons(self):
@@ -2474,9 +2468,7 @@ class PreMarketScanner(tk.Tk):
                     continue
                 s = card.story
                 story_key = s.get("story_key") or ""
-                story_tickers = set(s.get("tickers", [])[:3])
-                pin_already = (story_key in self.pinned_stories) or \
-                              (bool(story_tickers) and story_tickers.issubset(self.watchlist))
+                pin_already = story_key in self.pinned_stories
                 card.pinned_keys = self.pinned_stories
                 card.watchlist = self.watchlist
                 btn_text = "✓ Pinned" if pin_already else "📌 Pin"
