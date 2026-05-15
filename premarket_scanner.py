@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.9.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -301,6 +301,40 @@ def is_premarket_now():
 
 _PRICE_CACHE = {}        # ticker -> (timestamp, price_dict)
 _PRICE_CACHE_TTL = 60    # seconds; quote endpoint is fast, don't over-call
+
+# Bounded worker pool — caps concurrent network calls so opening Outcomes
+# (which can spawn 50+ price fetches at once) doesn't lock up the UI.
+_PRICE_WORK_QUEUE = queue.Queue()
+_PRICE_WORKERS_STARTED = False
+_PRICE_WORKER_COUNT = 4
+
+def _price_worker_loop():
+    while True:
+        try:
+            job = _PRICE_WORK_QUEUE.get()
+            if job is None:
+                return
+            ticker, callback = job
+            try:
+                result = fetch_quote(ticker)
+            except Exception:
+                result = None
+            try:
+                callback(result)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+def submit_price_fetch(ticker, callback):
+    """Submit a price-fetch job to the bounded worker pool.
+    callback(result) will be called with the price dict (or None) when done."""
+    global _PRICE_WORKERS_STARTED
+    if not _PRICE_WORKERS_STARTED:
+        _PRICE_WORKERS_STARTED = True
+        for _ in range(_PRICE_WORKER_COUNT):
+            threading.Thread(target=_price_worker_loop, daemon=True).start()
+    _PRICE_WORK_QUEUE.put((ticker, callback))
 
 def _fetch_quote_yahoo(ticker):
     """Yahoo's chart endpoint — no auth required, unlike the quote endpoint."""
@@ -1147,16 +1181,16 @@ def extract_tickers(text, allow_network=True):
                 break
 
     # Strategy 3: corporate-suffix-named entities → Yahoo lookup
-    if allow_network and len(found) < 3:
+    # Always run if no explicit/dictionary tickers found yet, or if we found very few.
+    if allow_network and len(found) < 2:
         for m in _RE_NAMED_COMPANY.finditer(text):
             full_name = m.group(0)
-            # Avoid lookups that are too generic
             if len(full_name) < 8:
                 continue
             tkr = resolve_company_to_ticker(full_name)
             if tkr and tkr not in seen and tkr not in TICKER_BLACKLIST:
                 seen.add(tkr); found.append(tkr)
-                if len(found) >= 6:
+                if len(found) >= 4:
                     break
 
     # Strategy 4: bare ALL-CAPS only if nothing else worked
@@ -1605,45 +1639,53 @@ class StoryDetailPanel(tk.Frame):
                               font=(FONT_DISPLAY, 11, "bold"))
         price_lbl.pack(side="left")
 
-        # Look up headline price from DB if this story is persisted
-        story_id = self.story.get("db_id") or self._find_story_id()
-        headline_info = db_get_headline_price(story_id, ticker) if story_id else None
+        # Look up headline price from DB if this story is persisted (off main thread)
+        def db_lookup_and_fetch():
+            story_id = self.story.get("db_id") or self._find_story_id()
+            headline_info = db_get_headline_price(story_id, ticker) if story_id else None
 
-        def update_price():
-            q = fetch_quote(ticker)
-            if not q:
-                try: price_lbl.config(text="Price unavailable", fg=PALETTE["text_mute"])
-                except tk.TclError: pass
-                return
-            color = PALETTE["accent_2"] if q["change_pct"] >= 0 else PALETTE["danger"]
-            sign = "+" if q["change_pct"] >= 0 else ""
-            text = f"${q['price']:.2f}  ({sign}{q['change_pct']:.2f}% today)"
-            try:
-                price_lbl.config(text=text, fg=color)
-            except tk.TclError:
-                pass
+            def on_quote(q):
+                def update_ui():
+                    if not q:
+                        try: price_lbl.config(text="Price unavailable", fg=PALETTE["text_mute"])
+                        except tk.TclError: pass
+                        return
+                    color = PALETTE["accent_2"] if q["change_pct"] >= 0 else PALETTE["danger"]
+                    sign = "+" if q["change_pct"] >= 0 else ""
+                    text = f"${q['price']:.2f}  ({sign}{q['change_pct']:.2f}% today)"
+                    try:
+                        price_lbl.config(text=text, fg=color)
+                    except tk.TclError:
+                        pass
 
-            # If we have a stored headline price, show outcome (this is the "review")
-            if headline_info:
-                hp = headline_info["price"]
-                delta = q["price"] - hp
-                delta_pct = (delta / hp * 100) if hp else 0
-                outcome_color = PALETTE["accent_2"] if delta_pct >= 0 else PALETTE["danger"]
-                outcome_sign = "+" if delta_pct >= 0 else ""
+                    if headline_info:
+                        hp = headline_info["price"]
+                        delta = q["price"] - hp
+                        delta_pct = (delta / hp * 100) if hp else 0
+                        outcome_color = PALETTE["accent_2"] if delta_pct >= 0 else PALETTE["danger"]
+                        outcome_sign = "+" if delta_pct >= 0 else ""
+                        try:
+                            captured = datetime.fromisoformat(headline_info["captured_at"])
+                            captured_str = captured.astimezone(ET_ZONE).strftime("%b %d, %I:%M %p ET")
+                        except Exception:
+                            captured_str = "earlier"
+                        try:
+                            outcome = tk.Label(price_row,
+                                text=f"   ●   Since headline (${hp:.2f} at {captured_str}): "
+                                     f"{outcome_sign}${delta:.2f} ({outcome_sign}{delta_pct:.2f}%)",
+                                bg=PALETTE["panel"], fg=outcome_color,
+                                font=(FONT_DISPLAY, 9, "bold"))
+                            outcome.pack(side="left", padx=(8, 0))
+                        except tk.TclError:
+                            pass
                 try:
-                    captured = datetime.fromisoformat(headline_info["captured_at"])
-                    captured_str = captured.astimezone(ET_ZONE).strftime("%b %d, %I:%M %p ET")
-                except Exception:
-                    captured_str = "earlier"
-                outcome = tk.Label(price_row,
-                    text=f"   ●   Since headline (${hp:.2f} at {captured_str}): "
-                         f"{outcome_sign}${delta:.2f} ({outcome_sign}{delta_pct:.2f}%)",
-                    bg=PALETTE["panel"], fg=outcome_color,
-                    font=(FONT_DISPLAY, 9, "bold"))
-                try: outcome.pack(side="left", padx=(8, 0))
-                except tk.TclError: pass
+                    price_lbl.after(0, update_ui)
+                except tk.TclError:
+                    pass
 
-        threading.Thread(target=update_price, daemon=True).start()
+            submit_price_fetch(ticker, on_quote)
+
+        threading.Thread(target=db_lookup_and_fetch, daemon=True).start()
 
         # TradingView CTA
         tv_url = f"https://www.tradingview.com/symbols/{quote_plus(ticker)}/"
@@ -1694,14 +1736,16 @@ class StoryDetailPanel(tk.Frame):
 
 class StoryCard(tk.Frame):
     def __init__(self, master, story, on_click, on_pin=None, watchlist=None,
-                 show_outcome=False, **kw):
+                 pinned_keys=None, show_outcome=False, **kw):
         super().__init__(master, bg=PALETTE["panel"], bd=0, highlightthickness=1,
                          highlightbackground=PALETTE["border_soft"], **kw)
         self.story = story
         self.on_click = on_click
         self.on_pin = on_pin
         self.watchlist = watchlist or set()
+        self.pinned_keys = pinned_keys or set()
         self.show_outcome = show_outcome
+        self._pin_btn = None
         self._build()
         self._bind_click(self)
 
@@ -1835,20 +1879,24 @@ class StoryCard(tk.Frame):
                      fg="#0a0e1c", font=(FONT_DISPLAY, 8, "bold")
                      ).pack(side="right", padx=(4, 0))
 
-        # Pin to watchlist button — only show if there are tickers to pin AND on_pin is wired
-        if s.get("tickers") and self.on_pin:
-            tickers_to_pin = set(s["tickers"][:3])
-            pin_already = bool(tickers_to_pin) and tickers_to_pin.issubset(self.watchlist)
-            btn_text = "✓ Pinned" if pin_already else "📌 Pin Tickers"
+        # Pin button — always shown when on_pin is wired. Works for stories with or
+        # without tickers. Pinned state is based on either tickers in watchlist OR
+        # story_key in pinned_stories.
+        if self.on_pin:
+            story_key = s.get("story_key") or re.sub(r"[^a-z0-9]+", "", s.get("title", "").lower())[:120]
+            story_tickers = set(s.get("tickers", [])[:3])
+            pin_already = (story_key in self.pinned_keys) or \
+                          (bool(story_tickers) and story_tickers.issubset(self.watchlist))
+            btn_text = "✓ Pinned" if pin_already else "📌 Pin"
             btn_bg = PALETTE["panel_alt"] if pin_already else PALETTE["accent"]
             btn_fg = PALETTE["text_mute"] if pin_already else "#0a0e1c"
-            pin_btn = tk.Button(bot, text=btn_text,
+            self._pin_btn = tk.Button(bot, text=btn_text,
                 bg=btn_bg, fg=btn_fg,
                 font=(FONT_DISPLAY, 8, "bold"),
                 bd=0, relief="flat", cursor="hand2",
                 activebackground=PALETTE["accent_hi"],
                 command=self._handle_pin, padx=8, pady=3)
-            pin_btn.pack(side="right", padx=(0, 6))
+            self._pin_btn.pack(side="right", padx=(0, 6))
 
         # "View details" hint
         tk.Label(bot, text="Click for details →", bg=PALETTE["panel"],
@@ -1915,47 +1963,57 @@ class StoryCard(tk.Frame):
         tk.Frame(outcome_frame, bg=PALETTE["bg_alt"], height=4).pack(fill="x")
 
     def _async_load_outcome(self, story, ticker, label_widget):
-        """Background fetch of headline-time + current price for one ticker."""
-        def worker():
-            story_id = story.get("db_id")
-            if not story_id:
-                # Try lookup via story_key
+        """Background fetch of headline-time + current price for one ticker.
+        Uses the shared bounded worker pool so opening Outcomes view doesn't
+        spawn dozens of network threads at once."""
+        story_id_holder = {"id": story.get("db_id")}
+
+        # Look up DB story id off the main thread (sqlite is fast but not instant)
+        def lookup_then_fetch():
+            if not story_id_holder["id"]:
                 try:
                     conn = db_connect()
                     cur = conn.execute("SELECT id FROM stories WHERE story_key=?",
                                        (story.get("story_key", ""),))
                     row = cur.fetchone()
                     conn.close()
-                    story_id = row[0] if row else None
+                    story_id_holder["id"] = row[0] if row else None
                 except Exception:
-                    story_id = None
-            headline_info = db_get_headline_price(story_id, ticker) if story_id else None
-            current = fetch_quote(ticker)
+                    pass
+            headline_info = db_get_headline_price(story_id_holder["id"], ticker) \
+                            if story_id_holder["id"] else None
 
-            def update():
-                try:
-                    if not current:
-                        label_widget.config(text="Current price unavailable", fg=PALETTE["text_mute"])
-                        return
-                    if not headline_info:
+            def on_current(current):
+                def update():
+                    try:
+                        if not current:
+                            label_widget.config(text="Current price unavailable",
+                                                fg=PALETTE["text_mute"])
+                            return
+                        if not headline_info:
+                            label_widget.config(
+                                text=f"${current['price']:.2f} now  ·  No headline price recorded",
+                                fg=PALETTE["text_dim"])
+                            return
+                        hp = headline_info["price"]
+                        cp = current["price"]
+                        delta = cp - hp
+                        delta_pct = (delta / hp * 100) if hp else 0
+                        color = PALETTE["accent_2"] if delta_pct >= 0 else PALETTE["danger"]
+                        sign = "+" if delta_pct >= 0 else ""
                         label_widget.config(
-                            text=f"${current['price']:.2f} now  ·  No headline price recorded",
-                            fg=PALETTE["text_dim"])
-                        return
-                    hp = headline_info["price"]
-                    cp = current["price"]
-                    delta = cp - hp
-                    delta_pct = (delta / hp * 100) if hp else 0
-                    color = PALETTE["accent_2"] if delta_pct >= 0 else PALETTE["danger"]
-                    sign = "+" if delta_pct >= 0 else ""
-                    label_widget.config(
-                        text=f"${hp:.2f} → ${cp:.2f}     {sign}{delta_pct:.2f}%   ({sign}${delta:.2f})",
-                        fg=color, font=(FONT_DISPLAY, 10, "bold"))
+                            text=f"${hp:.2f} → ${cp:.2f}     {sign}{delta_pct:.2f}%   ({sign}${delta:.2f})",
+                            fg=color, font=(FONT_DISPLAY, 10, "bold"))
+                    except tk.TclError:
+                        pass
+                try:
+                    label_widget.after(0, update)
                 except tk.TclError:
                     pass
-            label_widget.after(0, update)
 
-        threading.Thread(target=worker, daemon=True).start()
+            submit_price_fetch(ticker, on_current)
+
+        threading.Thread(target=lookup_then_fetch, daemon=True).start()
 
 
 # ─────────────────────────── MAIN WINDOW ──────────────────────────────────────
@@ -1970,7 +2028,8 @@ class PreMarketScanner(tk.Tk):
 
         self.stories = []
         self.filtered = []
-        self.watchlist = set()
+        self.watchlist = set()           # set of tickers
+        self.pinned_stories = set()      # set of story_keys (for stories you bookmarked, may or may not have tickers)
         self.active_categories = set(ALL_CATEGORIES)
         self.min_score = tk.IntVar(value=20)
         self.show_only_watchlist = tk.BooleanVar(value=False)
@@ -1979,6 +2038,7 @@ class PreMarketScanner(tk.Tk):
         self.fetch_queue = queue.Queue()
         self.next_refresh_at = None
         self._refresh_job = None
+        self._price_cache_for_view = {}  # ticker -> price dict (warmed in background to avoid UI hitch)
 
         self._load_settings()
         self._build_ui()
@@ -2000,6 +2060,7 @@ class PreMarketScanner(tk.Tk):
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self.watchlist = set(data.get("watchlist", []))
+            self.pinned_stories = set(data.get("pinned_stories", []))
             self.min_score.set(int(data.get("min_score", 20)))
             cats = data.get("categories")
             if cats:
@@ -2014,6 +2075,7 @@ class PreMarketScanner(tk.Tk):
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump({
                     "watchlist": sorted(self.watchlist),
+                    "pinned_stories": sorted(self.pinned_stories),
                     "min_score": int(self.min_score.get()),
                     "categories": sorted(self.active_categories),
                     "only_watchlist": bool(self.show_only_watchlist.get()),
@@ -2335,6 +2397,7 @@ class PreMarketScanner(tk.Tk):
             child.destroy()
 
         view = self.view_mode.get() if hasattr(self, "view_mode") else "live"
+        self._rendered_cards = []  # keep references for pin-button updates
 
         if not self.filtered:
             empty_msg = (
@@ -2350,12 +2413,14 @@ class PreMarketScanner(tk.Tk):
                 ).pack(pady=40)
         else:
             for s in self.filtered[:MAX_STORIES]:
-                StoryCard(self.cards_frame, s,
+                card = StoryCard(self.cards_frame, s,
                           on_click=self._on_card_click,
                           on_pin=self._pin_story_tickers,
                           watchlist=self.watchlist,
-                          show_outcome=(view == "outcomes")
-                          ).pack(fill="x", padx=6, pady=4)
+                          pinned_keys=self.pinned_stories,
+                          show_outcome=(view == "outcomes"))
+                card.pack(fill="x", padx=6, pady=4)
+                self._rendered_cards.append(card)
 
         view_label = "outcomes" if view == "outcomes" else "stories"
         self.count_lbl.config(
@@ -2364,20 +2429,62 @@ class PreMarketScanner(tk.Tk):
         self.canvas.yview_moveto(0)
 
     def _pin_story_tickers(self, story):
-        """Add this story's tickers to the watchlist."""
-        new_tickers = set(story.get("tickers", [])[:3])
-        if not new_tickers:
-            return
-        added = new_tickers - self.watchlist
-        self.watchlist |= new_tickers
+        """Pin/unpin a story. Adds tickers to watchlist (if any) AND bookmarks the story itself."""
+        story_key = story.get("story_key", "")
+        if not story_key:
+            story_key = re.sub(r"[^a-z0-9]+", "", story.get("title", "").lower())[:120]
+            story["story_key"] = story_key
+
+        story_tickers = set(story.get("tickers", [])[:3])
+        is_currently_pinned = (story_key in self.pinned_stories) or \
+                              (story_tickers and story_tickers.issubset(self.watchlist))
+
+        if is_currently_pinned:
+            # Unpin: remove story key + any tickers that came only from this story
+            self.pinned_stories.discard(story_key)
+            # Don't remove tickers from watchlist automatically — user might want to keep
+            # tracking them after unbookmarking the story. Only the story_key is unbookmarked.
+            LOGGER.info(f"UNPINNED story: {story_key}")
+        else:
+            # Pin: bookmark the story, and add any tickers to watchlist
+            self.pinned_stories.add(story_key)
+            added_tickers = story_tickers - self.watchlist
+            self.watchlist |= story_tickers
+            if added_tickers:
+                LOGGER.info(f"PINNED story + added tickers: {','.join(sorted(added_tickers))}")
+            else:
+                LOGGER.info(f"PINNED story (no tickers): {story.get('title','')[:60]}")
+
         # Refresh the entry box
         self.watch_entry.delete(0, tk.END)
         self.watch_entry.insert(0, ", ".join(sorted(self.watchlist)))
         self._rescore_watch_matches()
-        self._apply_filters()
         self._save_settings()
-        if added:
-            LOGGER.info(f"PINNED to watchlist: {','.join(sorted(added))}")
+        # Don't re-render whole list — just update this card's pin button state if possible.
+        # Cheaper than re-rendering all cards.
+        self._refresh_pin_buttons()
+
+    def _refresh_pin_buttons(self):
+        """Update just the pin button visuals on rendered cards — much cheaper than re-rendering everything."""
+        if not hasattr(self, "_rendered_cards"):
+            return
+        for card in self._rendered_cards:
+            try:
+                if not card._pin_btn:
+                    continue
+                s = card.story
+                story_key = s.get("story_key") or ""
+                story_tickers = set(s.get("tickers", [])[:3])
+                pin_already = (story_key in self.pinned_stories) or \
+                              (bool(story_tickers) and story_tickers.issubset(self.watchlist))
+                card.pinned_keys = self.pinned_stories
+                card.watchlist = self.watchlist
+                btn_text = "✓ Pinned" if pin_already else "📌 Pin"
+                btn_bg = PALETTE["panel_alt"] if pin_already else PALETTE["accent"]
+                btn_fg = PALETTE["text_mute"] if pin_already else "#0a0e1c"
+                card._pin_btn.config(text=btn_text, bg=btn_bg, fg=btn_fg)
+            except (tk.TclError, AttributeError):
+                pass
 
     def _set_view(self, mode):
         """Switch between 'live' and 'outcomes' views."""
@@ -2405,7 +2512,10 @@ class PreMarketScanner(tk.Tk):
             LOGGER.exception(f"Failed to show detail panel: {e}")
 
     def _show_detail_panel(self, story):
-        """Hide the results area and overlay the detail panel inside the main window."""
+        """Hide the results area and overlay the detail panel inside the main window.
+        Shows an instant 'Loading...' placeholder, then builds the real panel on
+        the next event-loop tick. Makes the click feel snappy even when there
+        are many tickers / DB lookups."""
         # Hide the results main frame
         if hasattr(self, "_results_main"):
             self._results_main.pack_forget()
@@ -2413,10 +2523,30 @@ class PreMarketScanner(tk.Tk):
         if hasattr(self, "_detail_panel") and self._detail_panel:
             try: self._detail_panel.destroy()
             except Exception: pass
-        # Build new panel inside the same parent
-        self._detail_panel = StoryDetailPanel(
-            self._results_parent, story, on_close=self._hide_detail_panel)
-        self._detail_panel.pack(side="right", fill="both", expand=True)
+
+        # Show an instant placeholder
+        placeholder = tk.Frame(self._results_parent, bg=PALETTE["bg"])
+        placeholder.pack(side="right", fill="both", expand=True)
+        tk.Label(placeholder, text="Loading…",
+                 bg=PALETTE["bg"], fg=PALETTE["text_mute"],
+                 font=(FONT_DISPLAY, 12)).pack(expand=True)
+        self._detail_panel = placeholder
+
+        # Build the real panel after the event loop renders the placeholder
+        def build_real():
+            if self._detail_panel is not placeholder:
+                # User already closed or switched
+                return
+            try: placeholder.destroy()
+            except Exception: pass
+            try:
+                self._detail_panel = StoryDetailPanel(
+                    self._results_parent, story, on_close=self._hide_detail_panel)
+                self._detail_panel.pack(side="right", fill="both", expand=True)
+            except Exception as e:
+                LOGGER.exception(f"Detail panel build failed: {e}")
+
+        self.after(20, build_real)
 
     def _hide_detail_panel(self):
         if hasattr(self, "_detail_panel") and self._detail_panel:
