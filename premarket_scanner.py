@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
+"""
+Pre-Market Bullish News Scanner — v2
+=====================================
+A desktop app that pulls headlines from free RSS feeds (Reuters, MarketWatch,
+Benzinga, Globe Newswire, SEC EDGAR press releases, Yahoo Finance), scores them
+0-100 for bullish conviction, tags catalysts, extracts tickers, and auto-refreshes
+every 5 minutes during pre-market hours (4:00 AM - 9:30 AM ET).
 
+Dependencies: tkinter (stdlib), tzdata (pip install tzdata) on Windows.
+Run:          python premarket_scanner.py
+"""
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -13,6 +23,7 @@ import shutil
 import hashlib
 import tempfile
 import subprocess
+import sqlite3
 import logging
 import webbrowser
 from datetime import datetime, timezone, timedelta
@@ -34,14 +45,16 @@ except ImportError:
 ET_ZONE = ZoneInfo("America/New_York")
 LOG_FILE = os.path.join(os.path.expanduser("~"), "premarket_alerts.log")
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".premarket_scanner.json")
+DB_FILE = os.path.join(os.path.expanduser("~"), ".premarket_stories.db")
 REFRESH_INTERVAL_SEC = 300
-MAX_STORIES = 80  # cards rendered at once; lower = smoother window resize
+MAX_STORIES = 80
+PERSIST_MIN_SCORE = 30   # stories at/above this score get saved to DB
 USER_AGENT = "Mozilla/5.0 (PremarketScanner/1.0)"
 HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -64,6 +77,7 @@ RSS_FEEDS = {
     ],
     "Yahoo Finance": [
         "https://finance.yahoo.com/news/rssindex",
+    ],
 }
 
 CATALYST_KEYWORDS = {
@@ -274,6 +288,212 @@ def is_premarket_now():
     start = now_et.replace(hour=4, minute=0, second=0, microsecond=0)
     end = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     return start <= now_et <= end
+
+# ───────────────────────────── PRICE FETCHING ─────────────────────────────────
+# Uses Yahoo Finance's public quote endpoint. Free, may be slightly delayed.
+
+_PRICE_CACHE = {}        # ticker -> (timestamp, price_dict)
+_PRICE_CACHE_TTL = 60    # seconds; quote endpoint is fast, don't over-call
+
+def fetch_quote(ticker):
+    """
+    Returns {'price': float, 'change': float, 'change_pct': float, 'prev_close': float}
+    or None if unavailable. Cached for 60s.
+    """
+    now = datetime.now(timezone.utc).timestamp()
+    cached = _PRICE_CACHE.get(ticker)
+    if cached and (now - cached[0] < _PRICE_CACHE_TTL):
+        return cached[1]
+
+    try:
+        # Yahoo's quote endpoint, no key required
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={quote_plus(ticker)}"
+        req = Request(url, headers={"User-Agent": USER_AGENT})
+        with urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+        results = data.get("quoteResponse", {}).get("result", [])
+        if not results:
+            return None
+        q = results[0]
+        price = q.get("regularMarketPrice") or q.get("preMarketPrice") or q.get("postMarketPrice")
+        prev = q.get("regularMarketPreviousClose") or q.get("previousClose")
+        if price is None or prev is None:
+            return None
+        change = price - prev
+        change_pct = (change / prev * 100) if prev else 0
+        out = {"price": float(price), "change": float(change),
+               "change_pct": float(change_pct), "prev_close": float(prev)}
+        _PRICE_CACHE[ticker] = (now, out)
+        return out
+    except (HTTPError, URLError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        LOGGER.debug(f"Quote fetch failed for {ticker}: {e}")
+        return None
+    except Exception as e:
+        LOGGER.warning(f"Unexpected quote error for {ticker}: {e}")
+        return None
+
+# ───────────────────────────── STORY DATABASE ─────────────────────────────────
+
+def db_connect():
+    """Open the SQLite store and ensure schema exists."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stories (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            story_key     TEXT UNIQUE,
+            title         TEXT,
+            summary       TEXT,
+            link          TEXT,
+            source        TEXT,
+            published     TEXT,     -- ISO 8601 UTC
+            captured_at   TEXT,     -- when we first saw it (UTC)
+            score         INTEGER,
+            catalysts     TEXT,     -- JSON list
+            tickers       TEXT,     -- JSON list
+            session_date  TEXT      -- ET date string (YYYY-MM-DD)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS price_snapshots (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            story_id    INTEGER,
+            ticker      TEXT,
+            captured_at TEXT,        -- UTC ISO
+            price       REAL,
+            change_pct  REAL,
+            kind        TEXT,        -- 'headline' | 'open' | 'review'
+            FOREIGN KEY (story_id) REFERENCES stories(id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session ON stories(session_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_snap_story ON price_snapshots(story_id)")
+    conn.commit()
+    return conn
+
+def session_date_for(dt_utc):
+    """The 'trading session date' a story belongs to (ET date). Stories before
+    the next pre-market open belong to the prior session."""
+    et = dt_utc.astimezone(ET_ZONE) if dt_utc.tzinfo else dt_utc.replace(tzinfo=ET_ZONE)
+    # Stories captured 4 AM ET onward belong to that day's session.
+    # Before 4 AM: belong to the previous calendar day's session.
+    if et.hour < 4:
+        et = et - timedelta(days=1)
+    return et.strftime("%Y-%m-%d")
+
+def db_save_story(story):
+    """Insert a story if not already present. Returns story DB id."""
+    try:
+        conn = db_connect()
+        published = story.get("published") or datetime.now(timezone.utc)
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=timezone.utc)
+        captured = datetime.now(timezone.utc)
+        session = session_date_for(captured)
+
+        cur = conn.execute("SELECT id FROM stories WHERE story_key=?", (story["story_key"],))
+        row = cur.fetchone()
+        if row:
+            sid = row[0]
+        else:
+            cur = conn.execute("""
+                INSERT INTO stories (story_key,title,summary,link,source,published,
+                                     captured_at,score,catalysts,tickers,session_date)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                story["story_key"], story["title"], story.get("summary", ""),
+                story.get("link", ""), story.get("source", ""),
+                published.isoformat(), captured.isoformat(),
+                int(story.get("score", 0)),
+                json.dumps(story.get("catalysts", [])),
+                json.dumps(story.get("tickers", [])),
+                session,
+            ))
+            sid = cur.lastrowid
+        conn.commit()
+        conn.close()
+        return sid
+    except Exception as e:
+        LOGGER.warning(f"db_save_story failed: {e}")
+        return None
+
+def db_save_snapshot(story_id, ticker, price_info, kind):
+    if not story_id or not price_info:
+        return
+    try:
+        conn = db_connect()
+        conn.execute("""
+            INSERT INTO price_snapshots (story_id,ticker,captured_at,price,change_pct,kind)
+            VALUES (?,?,?,?,?,?)
+        """, (story_id, ticker, datetime.now(timezone.utc).isoformat(),
+              price_info["price"], price_info["change_pct"], kind))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        LOGGER.warning(f"db_save_snapshot failed: {e}")
+
+def db_load_stories(days_back=2):
+    """Load all stored stories from the past N sessions."""
+    out = []
+    try:
+        cutoff = (datetime.now(ET_ZONE) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        conn = db_connect()
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute("""
+            SELECT * FROM stories WHERE session_date >= ?
+            ORDER BY datetime(published) DESC
+        """, (cutoff,))
+        for r in cur.fetchall():
+            out.append({
+                "id": r["id"],
+                "story_key": r["story_key"],
+                "title": r["title"],
+                "summary": r["summary"] or "",
+                "link": r["link"] or "",
+                "source": r["source"] or "",
+                "published": datetime.fromisoformat(r["published"]),
+                "captured_at": datetime.fromisoformat(r["captured_at"]),
+                "score": r["score"],
+                "catalysts": json.loads(r["catalysts"] or "[]"),
+                "tickers": json.loads(r["tickers"] or "[]"),
+                "session_date": r["session_date"],
+                "persisted": True,
+            })
+        conn.close()
+    except Exception as e:
+        LOGGER.warning(f"db_load_stories failed: {e}")
+    return out
+
+def db_get_headline_price(story_id, ticker):
+    """Return the earliest captured price for this (story, ticker), or None."""
+    try:
+        conn = db_connect()
+        cur = conn.execute("""
+            SELECT price, captured_at, change_pct FROM price_snapshots
+            WHERE story_id=? AND ticker=?
+            ORDER BY datetime(captured_at) ASC LIMIT 1
+        """, (story_id, ticker))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return {"price": row[0], "captured_at": row[1], "change_pct": row[2]}
+    except Exception as e:
+        LOGGER.warning(f"db_get_headline_price failed: {e}")
+    return None
+
+def db_purge_old(days=14):
+    """Drop very old stories so DB doesn't grow forever."""
+    try:
+        cutoff = (datetime.now(ET_ZONE) - timedelta(days=days)).strftime("%Y-%m-%d")
+        conn = db_connect()
+        cur = conn.execute("DELETE FROM stories WHERE session_date < ?", (cutoff,))
+        conn.execute("DELETE FROM price_snapshots WHERE story_id NOT IN (SELECT id FROM stories)")
+        conn.commit()
+        deleted = cur.rowcount
+        conn.close()
+        if deleted:
+            LOGGER.info(f"Purged {deleted} old stories from DB.")
+    except Exception as e:
+        LOGGER.warning(f"db_purge_old failed: {e}")
 
 # ───────────────────────────── AUTO-UPDATER ───────────────────────────────────
 
@@ -836,7 +1056,7 @@ class StoryDetailWindow(tk.Toplevel):
                  ).pack(side="left")
 
     def _ticker_card(self, parent, ticker):
-        """Full-width card per ticker with prominent TradingView CTA and research links."""
+        """Full-width card per ticker: live price + TradingView CTA + research links."""
         card = tk.Frame(parent, bg=PALETTE["panel"],
                         highlightthickness=1, highlightbackground=PALETTE["border"])
         card.pack(fill="x", padx=24, pady=(0, 8))
@@ -849,23 +1069,70 @@ class StoryDetailWindow(tk.Toplevel):
                  fg=PALETTE["text"], font=(FONT_DISPLAY, 16, "bold")
                  ).pack(expand=True, padx=8, pady=14)
 
-        # Right column: TradingView CTA on top, links underneath
+        # Right column
         right = tk.Frame(card, bg=PALETTE["panel"])
         right.pack(side="left", fill="both", expand=True, padx=14, pady=10)
 
-        # Primary action — TradingView
+        # Live price row — populated asynchronously
+        price_row = tk.Frame(right, bg=PALETTE["panel"])
+        price_row.pack(fill="x", pady=(0, 6))
+        price_lbl = tk.Label(price_row, text="Loading price…",
+                              bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                              font=(FONT_DISPLAY, 11, "bold"))
+        price_lbl.pack(side="left")
+
+        # Look up headline price from DB if this story is persisted
+        story_id = self.story.get("db_id") or self._find_story_id()
+        headline_info = db_get_headline_price(story_id, ticker) if story_id else None
+
+        def update_price():
+            q = fetch_quote(ticker)
+            if not q:
+                try: price_lbl.config(text="Price unavailable", fg=PALETTE["text_mute"])
+                except tk.TclError: pass
+                return
+            color = PALETTE["accent_2"] if q["change_pct"] >= 0 else PALETTE["danger"]
+            sign = "+" if q["change_pct"] >= 0 else ""
+            text = f"${q['price']:.2f}  ({sign}{q['change_pct']:.2f}% today)"
+            try:
+                price_lbl.config(text=text, fg=color)
+            except tk.TclError:
+                pass
+
+            # If we have a stored headline price, show outcome (this is the "review")
+            if headline_info:
+                hp = headline_info["price"]
+                delta = q["price"] - hp
+                delta_pct = (delta / hp * 100) if hp else 0
+                outcome_color = PALETTE["accent_2"] if delta_pct >= 0 else PALETTE["danger"]
+                outcome_sign = "+" if delta_pct >= 0 else ""
+                try:
+                    captured = datetime.fromisoformat(headline_info["captured_at"])
+                    captured_str = captured.astimezone(ET_ZONE).strftime("%b %d, %I:%M %p ET")
+                except Exception:
+                    captured_str = "earlier"
+                outcome = tk.Label(price_row,
+                    text=f"   ●   Since headline (${hp:.2f} at {captured_str}): "
+                         f"{outcome_sign}${delta:.2f} ({outcome_sign}{delta_pct:.2f}%)",
+                    bg=PALETTE["panel"], fg=outcome_color,
+                    font=(FONT_DISPLAY, 9, "bold"))
+                try: outcome.pack(side="left", padx=(8, 0))
+                except tk.TclError: pass
+
+        threading.Thread(target=update_price, daemon=True).start()
+
+        # TradingView CTA
         tv_url = f"https://www.tradingview.com/symbols/{quote_plus(ticker)}/"
-        tv_btn = tk.Button(right,
+        tk.Button(right,
             text=f"📈   OPEN ${ticker} CHART ON TRADINGVIEW",
             bg=PALETTE["accent_2"], fg="#0a0e1c",
             font=(FONT_DISPLAY, 10, "bold"),
             bd=0, relief="flat", cursor="hand2",
             activebackground="#34d399",
             command=lambda u=tv_url: webbrowser.open(u),
-            padx=10, pady=8, anchor="w")
-        tv_btn.pack(fill="x")
+            padx=10, pady=8, anchor="w").pack(fill="x")
 
-        # Secondary research row
+        # Research links
         sec_row = tk.Frame(right, bg=PALETTE["panel"])
         sec_row.pack(fill="x", pady=(8, 0))
         tk.Label(sec_row, text="Research:", bg=PALETTE["panel"],
@@ -883,6 +1150,20 @@ class StoryDetailWindow(tk.Toplevel):
                          cursor="hand2", padx=4, pady=4)
             b.pack(side="left", padx=(0, 4))
             b.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
+
+    def _find_story_id(self):
+        """Look up the story's DB id by story_key, if it exists."""
+        key = self.story.get("story_key")
+        if not key:
+            return None
+        try:
+            conn = db_connect()
+            cur = conn.execute("SELECT id FROM stories WHERE story_key=?", (key,))
+            row = cur.fetchone()
+            conn.close()
+            return row[0] if row else None
+        except Exception:
+            return None
 
 
 # ─────────────────────────── STORY CARD ───────────────────────────────────────
@@ -936,6 +1217,14 @@ class StoryCard(tk.Frame):
         tk.Label(top, text=f"  ·  {time_ago(s['published'])}",
                  bg=PALETTE["panel"], fg=PALETTE["text_mute"],
                  font=(FONT_DISPLAY, 9)).pack(side="left")
+
+        # "FROM PREVIOUS SESSION" badge for stories carried over from earlier sessions
+        if s.get("persisted"):
+            today_session = session_date_for(datetime.now(timezone.utc))
+            if s.get("session_date") and s["session_date"] != today_session:
+                tk.Label(top, text="  ⏱ REVIEW  ", bg="#6366f1", fg=PALETTE["text"],
+                         font=(FONT_DISPLAY, 8, "bold")
+                         ).pack(side="left", padx=(8, 0))
 
         # Score badge
         score_wrap = tk.Frame(top, bg=PALETTE["panel"])
@@ -1047,6 +1336,9 @@ class PreMarketScanner(tk.Tk):
         # Check for updates on launch (non-blocking, won't notify unless update found)
         if UPDATE_CHECK_ON_LAUNCH:
             self.after(2500, self._silent_update_check_on_launch)
+
+        # Background DB housekeeping
+        threading.Thread(target=lambda: db_purge_old(days=14), daemon=True).start()
 
     def _load_settings(self):
         if not os.path.exists(SETTINGS_FILE):
@@ -1409,10 +1701,36 @@ class PreMarketScanner(tk.Tk):
                 s["breakdown"] = breakdown
                 s["tickers"] = extract_tickers(f"{s['title']} {s.get('summary', '')}")
                 s["watch_match"] = bool(self.watchlist & set(s["tickers"]))
+                s["story_key"] = re.sub(r"[^a-z0-9]+", "", s["title"].lower())[:120]
+
+                # Persist high-scoring stories + capture headline-time prices
+                if score >= PERSIST_MIN_SCORE:
+                    story_id = db_save_story(s)
+                    s["db_id"] = story_id
+                    if story_id and s["tickers"]:
+                        for t in s["tickers"][:3]:  # cap to first 3 tickers
+                            # Only capture once per (story, ticker)
+                            existing = db_get_headline_price(story_id, t)
+                            if existing is None:
+                                q = fetch_quote(t)
+                                if q:
+                                    db_save_snapshot(story_id, t, q, "headline")
+
             stories.sort(
                 key=lambda x: x.get("published") or datetime.now(timezone.utc),
                 reverse=True
             )
+
+            # Merge with persisted stories from this and previous session
+            persisted = db_load_stories(days_back=2)
+            new_keys = {s["story_key"] for s in stories}
+            for p in persisted:
+                if p["story_key"] not in new_keys:
+                    # Add persisted-only stories so user can see yesterday's catalysts
+                    p["breakdown"] = []  # not stored, fine
+                    p["watch_match"] = bool(self.watchlist & set(p.get("tickers", [])))
+                    stories.append(p)
+
             self.fetch_queue.put(("done", stories))
         except Exception as e:
             LOGGER.exception("Fetch worker error")
