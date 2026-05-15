@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -1918,38 +1918,50 @@ class StoryCard(tk.Frame):
             self.on_pin(self.story)
 
     def _build_outcome_row(self, parent, s):
-        """A row showing 'Price at headline → Price now' for each ticker. Async."""
+        """A row showing 'Price at headline → Price now' for each ticker.
+        Pre-market: shows current pre-market price with a clear PRE-MARKET label.
+        Market hours / after open: shows regular price with the outcome comparison."""
         outcome_frame = tk.Frame(parent, bg=PALETTE["bg_alt"])
         outcome_frame.pack(fill="x", padx=14, pady=(0, 8))
 
-        # The "review unlock" rule: results are only meaningful after market opens.
-        # Show "Locked" badge if it's still pre-market or earlier the same day.
-        story_published = s.get("published")
-        if story_published and story_published.tzinfo is None:
-            story_published = story_published.replace(tzinfo=timezone.utc)
-
         now_et = datetime.now(ET_ZONE)
-        # Review is "unlocked" if at least one full market open (9:30 AM ET) has elapsed since publication
-        review_unlocked = True
-        if story_published:
-            pub_et = story_published.astimezone(ET_ZONE)
-            # Unlock if today's date is after pub date AND it's past 11:30 AM ET on review day
-            same_day = pub_et.date() == now_et.date()
-            if same_day and now_et.hour < 11:
-                review_unlocked = False
+        is_premkt = is_premarket_now()
+        market_open_today = _market_open_passed_today()
+
+        # Pick a header label that matches what the user is actually looking at
+        if is_premkt:
+            header_text = "⏱  PRE-MARKET TRACKING"
+            header_color = PALETTE["warn"]
+            sub_text = "Market opens at 9:30 AM ET. Pre-market prices are thin and can swing wildly."
+        elif market_open_today and now_et.weekday() < 5:
+            header_text = "📊  OUTCOME REVIEW (MARKET OPEN)"
+            header_color = PALETTE["accent_2"]
+            sub_text = "Live regular-hours prices. Compare against the headline price below."
+        else:
+            header_text = "📊  OUTCOME REVIEW"
+            header_color = PALETTE["text_mute"]
+            sub_text = None
 
         header_row = tk.Frame(outcome_frame, bg=PALETTE["bg_alt"])
         header_row.pack(fill="x", padx=10, pady=(6, 2))
-        tk.Label(header_row, text="📊  OUTCOME REVIEW",
-                 bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
-                 font=(FONT_DISPLAY, 8, "bold")
+        tk.Label(header_row, text=header_text,
+                 bg=PALETTE["bg_alt"], fg=header_color,
+                 font=(FONT_DISPLAY, 9, "bold")
                  ).pack(side="left")
 
-        if not review_unlocked:
-            tk.Label(header_row, text="🔒 Available after 11:30 AM ET review window",
-                     bg=PALETTE["bg_alt"], fg=PALETTE["warn"],
-                     font=(FONT_DISPLAY, 8, "italic")
-                     ).pack(side="left", padx=(10, 0))
+        if sub_text:
+            tk.Label(outcome_frame, text=sub_text,
+                     bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
+                     font=(FONT_DISPLAY, 8, "italic"),
+                     anchor="w", justify="left", wraplength=700
+                     ).pack(fill="x", padx=10, pady=(0, 4))
+
+        if not s.get("tickers"):
+            tk.Label(outcome_frame,
+                text="  No ticker detected for this story — outcome can't be tracked.",
+                bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
+                font=(FONT_DISPLAY, 9), anchor="w"
+                ).pack(fill="x", padx=10, pady=(2, 6))
             return
 
         # Render one row per ticker, async-fill prices
@@ -1961,14 +1973,15 @@ class StoryCard(tk.Frame):
                      fg=PALETTE["text"], font=(FONT_DISPLAY, 10, "bold"),
                      width=8, anchor="w").pack(side="left")
 
-            status = tk.Label(row, text="Loading review…",
+            status_text = "Loading pre-market price…" if is_premkt else "Loading review…"
+            status = tk.Label(row, text=status_text,
                               bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
                               font=(FONT_DISPLAY, 9))
             status.pack(side="left", padx=(8, 0))
 
             self._async_load_outcome(s, ticker, status)
 
-        # Add a tiny bottom padding
+        # Tiny bottom padding
         tk.Frame(outcome_frame, bg=PALETTE["bg_alt"], height=4).pack(fill="x")
 
     def _async_load_outcome(self, story, ticker, label_widget):
@@ -1993,6 +2006,7 @@ class StoryCard(tk.Frame):
                             if story_id_holder["id"] else None
 
             def on_current(current):
+                is_premkt = is_premarket_now()
                 def update():
                     try:
                         if not current:
@@ -2000,8 +2014,9 @@ class StoryCard(tk.Frame):
                                                 fg=PALETTE["text_mute"])
                             return
                         if not headline_info:
+                            now_label = "pre-market" if is_premkt else "now"
                             label_widget.config(
-                                text=f"${current['price']:.2f} now  ·  No headline price recorded",
+                                text=f"${current['price']:.2f} {now_label}  ·  No headline price recorded",
                                 fg=PALETTE["text_dim"])
                             return
                         hp = headline_info["price"]
@@ -2010,8 +2025,10 @@ class StoryCard(tk.Frame):
                         delta_pct = (delta / hp * 100) if hp else 0
                         color = PALETTE["accent_2"] if delta_pct >= 0 else PALETTE["danger"]
                         sign = "+" if delta_pct >= 0 else ""
+                        # Make it clear when this is a pre-market reading
+                        prefix = "PRE-MKT: " if is_premkt else ""
                         label_widget.config(
-                            text=f"${hp:.2f} → ${cp:.2f}     {sign}{delta_pct:.2f}%   ({sign}${delta:.2f})",
+                            text=f"{prefix}${hp:.2f} → ${cp:.2f}     {sign}{delta_pct:.2f}%   ({sign}${delta:.2f})",
                             fg=color, font=(FONT_DISPLAY, 10, "bold"))
                     except tk.TclError:
                         pass
@@ -2642,6 +2659,11 @@ class PreMarketScanner(tk.Tk):
                 if not is_pinned:
                     if p.get("session_date") != current_session and today_market_open_passed:
                         continue
+
+                # If this persisted story was saved before the better ticker extractor
+                # was introduced, its tickers list may be empty. Re-extract now.
+                if not p.get("tickers"):
+                    p["tickers"] = extract_tickers(f"{p['title']} {p.get('summary','')}")
 
                 p["breakdown"] = []
                 p["watch_match"] = bool(self.watchlist & set(p.get("tickers", [])))
