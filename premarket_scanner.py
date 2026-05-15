@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -1144,23 +1144,76 @@ _RE_PAREN_TICK  = re.compile(
 )
 _RE_BARE_TICK = re.compile(r"\b([A-Z]{2,5})\b")
 
-# Match a company name followed by a corporate suffix — captures the FULL phrase
-# including the suffix so we can try resolving via Yahoo if not in our dictionary.
+# Match a company name followed by a corporate suffix. The full match is the
+# whole phrase; we strip stray punctuation (commas, parentheses) before lookup.
+# Loosened from the previous version: we now also catch names that occur
+# inside SEC EDGAR headlines like "Polar Power, Inc. (0001622345) (Filer)".
 _RE_NAMED_COMPANY = re.compile(
-    r"\b([A-Z][A-Za-z0-9&\.\-]+(?:\s+[A-Z][A-Za-z0-9&\.\-]+){0,4})\s+"
+    r"\b([A-Z][A-Za-z0-9&\.\-]+(?:[\s,]+[A-Z][A-Za-z0-9&\.\-]+){0,5})\s+"
     r"(Inc\.?|Incorporated|Corp\.?|Corporation|Co\.?|Ltd\.?|Limited|LLC|"
     r"Holdings?|Group|Technologies|Therapeutics|Pharmaceuticals?|Biosciences?|"
-    r"Labs?|Resources?|Energy|Industries|Systems|Networks?|Partners|"
-    r"Capital|Bancorp|Financial)\b"
+    r"Biotech|Labs?|Laboratories|Resources?|Energy|Industries|Systems|"
+    r"Networks?|Partners|Capital|Bancorp|Bank|Financial|Realty|Trust|"
+    r"Solutions|Services)\b"
 )
+
+# CIK number in SEC EDGAR headlines: a 10-digit number, usually in parens.
+# e.g. "8-K - Polar Power, Inc. (0001622345) (Filer)"
+_RE_SEC_CIK = re.compile(r"\b(\d{10})\b")
+
+# CIK → ticker cache. SEC publishes a free JSON mapping of every public filer.
+_CIK_TO_TICKER = None  # lazy-loaded dict: {cik_int: ticker_str}
+_CIK_LOAD_LOCK = threading.Lock()
+
+def _load_cik_map():
+    """Download SEC's official CIK→ticker map. Cached after first call.
+    Returns a dict of int(CIK) -> ticker string, or {} on failure."""
+    global _CIK_TO_TICKER
+    if _CIK_TO_TICKER is not None:
+        return _CIK_TO_TICKER
+    with _CIK_LOAD_LOCK:
+        if _CIK_TO_TICKER is not None:
+            return _CIK_TO_TICKER
+        try:
+            url = "https://www.sec.gov/files/company_tickers.json"
+            req = Request(url, headers={
+                "User-Agent": "BullScanner contact@example.com",  # SEC requires UA
+                "Accept": "application/json",
+            })
+            with urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            # Format: {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}, ...}
+            mapping = {}
+            for v in data.values():
+                cik = v.get("cik_str")
+                tkr = v.get("ticker")
+                if cik is not None and tkr:
+                    mapping[int(cik)] = tkr.upper()
+            _CIK_TO_TICKER = mapping
+            LOGGER.info(f"Loaded SEC CIK→ticker map: {len(mapping)} companies")
+        except Exception as e:
+            LOGGER.warning(f"Couldn't load SEC CIK map: {e}")
+            _CIK_TO_TICKER = {}
+        return _CIK_TO_TICKER
+
+def cik_to_ticker(cik_str):
+    """Given a 10-digit CIK string (or int), return the ticker, or None."""
+    try:
+        cik_int = int(str(cik_str).lstrip("0") or "0")
+    except (TypeError, ValueError):
+        return None
+    if cik_int <= 0:
+        return None
+    return _load_cik_map().get(cik_int)
 
 def extract_tickers(text, allow_network=True):
     """
     Extract tickers from text. Strategy:
     1. Explicit $TICK and (NASDAQ:TICK) — strongest signal
     2. Company-name lookup from bundled dictionary
-    3. Named entity + corporate suffix (e.g. "G-III Apparel Group") → Yahoo lookup (if network)
-    4. Bare ALL-CAPS with stock context — last resort
+    3. SEC CIK number lookup (for EDGAR 8-K filings)
+    4. Named entity + corporate suffix → Yahoo lookup (if network)
+    5. Bare ALL-CAPS with stock context — last resort
     """
     if not text:
         return []
@@ -1190,11 +1243,22 @@ def extract_tickers(text, allow_network=True):
             if len(found) >= 6:
                 break
 
-    # Strategy 3: corporate-suffix-named entities → Yahoo lookup
-    # Always run if no explicit/dictionary tickers found yet, or if we found very few.
+    # Strategy 3: SEC CIK number (for EDGAR 8-K headlines like
+    # "8-K - Polar Power, Inc. (0001622345) (Filer)")
+    if allow_network and len(found) < 2:
+        for cik_match in _RE_SEC_CIK.findall(text):
+            tkr = cik_to_ticker(cik_match)
+            if tkr and tkr not in seen and tkr not in TICKER_BLACKLIST:
+                seen.add(tkr); found.append(tkr)
+                if len(found) >= 4:
+                    break
+
+    # Strategy 4: corporate-suffix-named entities → Yahoo lookup
     if allow_network and len(found) < 2:
         for m in _RE_NAMED_COMPANY.finditer(text):
             full_name = m.group(0)
+            # Strip stray punctuation that gets caught by the loose regex
+            full_name = full_name.strip(" ,.")
             if len(full_name) < 8:
                 continue
             tkr = resolve_company_to_ticker(full_name)
