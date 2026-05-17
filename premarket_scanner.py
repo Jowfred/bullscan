@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.7.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -582,6 +582,160 @@ def fetch_daily_performance(ticker):
     except Exception as e:
         LOGGER.warning(f"daily perf unexpected error for {ticker}: {e}")
         return None
+
+def fetch_price_timeline(ticker, story_time_utc=None):
+    """
+    Fetch a full price timeline for a ticker including pre-market, regular hours,
+    and after-hours where available.
+
+    Returns dict with:
+      'sessions': list of dicts, each with:
+          {kind: 'premarket'|'regular'|'afterhours',
+           open_ts, close_ts, open_price, close_price, high, low,
+           date_label, is_current}
+      'around_headline': dict or None, with:
+          {before_ts, before_price, at_ts, at_price}
+      'extended_supported': bool — whether this ticker had any extended-hours prints
+      'date_iso': date string of the most recent session shown
+    Or None on failure.
+    """
+    if not ticker:
+        return None
+    try:
+        # Pull 5 days of minute data, including pre/post
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(ticker)}"
+               f"?interval=1m&range=5d&includePrePost=true")
+        req = Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+        })
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+
+        result = (data.get("chart", {}).get("result") or [None])[0]
+        if not result:
+            return None
+
+        meta = result.get("meta", {}) or {}
+        timestamps = result.get("timestamp") or []
+        quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+        closes = quote.get("close") or []
+
+        if not timestamps or not closes:
+            return None
+
+        # Determine trading-period boundaries from meta if available
+        # Yahoo's meta.tradingPeriods may include pre/regular/post arrays
+        trading_periods = meta.get("tradingPeriods") or {}
+
+        # Build candle list, filtering nulls
+        candles = []
+        for i, ts in enumerate(timestamps):
+            if i >= len(closes):
+                break
+            c = closes[i]
+            if c is None:
+                continue
+            candles.append({"ts": ts, "close": c,
+                            "high": (quote.get("high") or [None])[i] if i < len(quote.get("high") or []) else c,
+                            "low":  (quote.get("low")  or [None])[i] if i < len(quote.get("low")  or []) else c})
+
+        if not candles:
+            return None
+
+        # Classify each candle into pre-market, regular, or after-hours
+        # using ET hours: pre = 04:00-09:30, regular = 09:30-16:00, post = 16:00-20:00
+        def classify(ts):
+            dt = datetime.fromtimestamp(ts, ET_ZONE)
+            hm = dt.hour * 60 + dt.minute
+            if 4 * 60 <= hm < 9 * 60 + 30:   return "premarket", dt
+            if 9 * 60 + 30 <= hm < 16 * 60:  return "regular", dt
+            if 16 * 60 <= hm < 20 * 60:      return "afterhours", dt
+            return "off", dt
+
+        # Group candles by (date, kind)
+        from collections import OrderedDict
+        groups = OrderedDict()
+        for c in candles:
+            kind, dt = classify(c["ts"])
+            if kind == "off":
+                continue
+            key = (dt.strftime("%Y-%m-%d"), kind)
+            groups.setdefault(key, []).append(c)
+
+        # Build session summaries — only keep last 2 days for compactness
+        sessions = []
+        seen_dates = []
+        for (date_str, kind), group_candles in groups.items():
+            if date_str not in seen_dates:
+                seen_dates.append(date_str)
+            if len(seen_dates) > 2:
+                continue
+            if not group_candles:
+                continue
+            opens_ts = group_candles[0]["ts"]
+            closes_ts = group_candles[-1]["ts"]
+            open_price = group_candles[0]["close"]
+            close_price = group_candles[-1]["close"]
+            highs = [c["high"] for c in group_candles if c["high"] is not None]
+            lows = [c["low"] for c in group_candles if c["low"] is not None]
+            sessions.append({
+                "kind": kind,
+                "open_ts": opens_ts,
+                "close_ts": closes_ts,
+                "open_price": float(open_price),
+                "close_price": float(close_price),
+                "high": float(max(highs)) if highs else float(close_price),
+                "low": float(min(lows)) if lows else float(close_price),
+                "date_label": datetime.fromtimestamp(opens_ts, ET_ZONE).strftime("%a %b %d"),
+                "date_iso": date_str,
+            })
+
+        # Mark the most recent session as current
+        if sessions:
+            sessions[-1]["is_current"] = True
+
+        # Try to capture "around the headline" — the closest candles before and at
+        around_headline = None
+        if story_time_utc:
+            try:
+                target_ts = int(story_time_utc.timestamp())
+                # Find the candle closest to target_ts but before it (before news)
+                before = None
+                at = None
+                for c in candles:
+                    if c["ts"] <= target_ts:
+                        before = c
+                    elif at is None:
+                        at = c
+                        break
+                if before and at:
+                    around_headline = {
+                        "before_ts": before["ts"],
+                        "before_price": float(before["close"]),
+                        "at_ts": at["ts"],
+                        "at_price": float(at["close"]),
+                    }
+            except Exception as e:
+                LOGGER.debug(f"around_headline calc failed: {e}")
+
+        extended_supported = any(s["kind"] in ("premarket", "afterhours") for s in sessions)
+        date_iso = sessions[-1]["date_iso"] if sessions else None
+
+        return {
+            "sessions": sessions,
+            "around_headline": around_headline,
+            "extended_supported": extended_supported,
+            "date_iso": date_iso,
+        }
+
+    except (HTTPError, URLError) as e:
+        LOGGER.debug(f"price timeline fetch failed for {ticker}: {e}")
+        return None
+    except Exception as e:
+        LOGGER.warning(f"price timeline unexpected error for {ticker}: {e}")
+        return None
+
 
 def market_is_closed_for_today():
     """True if the regular session has ended for today (4:00 PM ET) on a weekday,
@@ -2120,6 +2274,19 @@ class StoryDetailPanel(tk.Frame):
                 font=(FONT_DISPLAY, 8), anchor="w", justify="left", wraplength=700
                 ).pack(fill="x", padx=24, pady=(4, 16))
 
+            # Price timeline — shows pre-market / regular / after-hours sessions
+            # plus the moment around when the news dropped.
+            self._section(body, "PRICE TIMELINE")
+            for t in s["tickers"][:3]:
+                self._price_timeline_card(body, t)
+            tk.Label(body,
+                text="Sessions shown in order: pre-market (4:00–9:30 AM ET), regular hours "
+                     "(9:30 AM–4:00 PM ET), after-hours (4:00–8:00 PM ET). Not all stocks trade "
+                     "extended hours — if no pre/post bars appear for a ticker, it likely doesn't.",
+                bg=PALETTE["bg"], fg=PALETTE["text_mute"],
+                font=(FONT_DISPLAY, 8), anchor="w", justify="left", wraplength=700
+                ).pack(fill="x", padx=24, pady=(4, 16))
+
             # Daily Performance Summary — shown after market close
             if market_is_closed_for_today():
                 self._section(body, "DAILY PERFORMANCE  ·  MARKET CLOSED")
@@ -2336,6 +2503,225 @@ class StoryDetailPanel(tk.Frame):
                          cursor="hand2", padx=4, pady=4)
             b.pack(side="left", padx=(0, 4))
             b.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
+
+    def _price_timeline_card(self, parent, ticker):
+        """Visual price timeline showing pre-market, regular, after-hours sessions,
+        plus the moment around when the news dropped. Async fetch."""
+        card = tk.Frame(parent, bg=PALETTE["panel"],
+                        highlightthickness=1, highlightbackground=PALETTE["border"])
+        card.pack(fill="x", padx=24, pady=(0, 8))
+
+        header = tk.Frame(card, bg=PALETTE["panel_alt"])
+        header.pack(fill="x")
+        tk.Label(header, text=f" ${ticker}  · PRICE TIMELINE ",
+                 bg=PALETTE["panel_alt"], fg=PALETTE["accent_hi"],
+                 font=(FONT_DISPLAY, 10, "bold"), padx=12, pady=8
+                 ).pack(side="left")
+        status_lbl = tk.Label(header, text=" Loading… ",
+                              bg=PALETTE["panel_alt"], fg=PALETTE["text_mute"],
+                              font=(FONT_DISPLAY, 9, "italic"))
+        status_lbl.pack(side="right", padx=12)
+
+        body = tk.Frame(card, bg=PALETTE["panel"])
+        body.pack(fill="x", padx=14, pady=10)
+        loading = tk.Label(body, text="Fetching session data…",
+                           bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                           font=(FONT_DISPLAY, 9))
+        loading.pack(anchor="w")
+
+        story_published = self.story.get("published")
+        if story_published and story_published.tzinfo is None:
+            story_published = story_published.replace(tzinfo=timezone.utc)
+
+        def worker():
+            tl = fetch_price_timeline(ticker, story_time_utc=story_published)
+            story_id = self.story.get("db_id") or self._find_story_id()
+            headline_info = db_get_headline_price(story_id, ticker) if story_id else None
+
+            def render():
+                try:
+                    loading.destroy()
+                    status_lbl.destroy()
+                except tk.TclError:
+                    return
+
+                if not tl or not tl.get("sessions"):
+                    tk.Label(body, text="Timeline data unavailable for this ticker.",
+                             bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                             font=(FONT_DISPLAY, 9), anchor="w"
+                             ).pack(fill="x")
+                    return
+
+                sessions = tl["sessions"]
+
+                # Build a single horizontal row of session bars
+                # Each session = a colored block with kind label, open price, close price, % change
+                ext_supported = tl.get("extended_supported", False)
+                if not ext_supported:
+                    tk.Label(body,
+                        text="ℹ️  This ticker does not appear to trade extended hours "
+                             "(no pre-market or after-hours prints in the last few days).",
+                        bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                        font=(FONT_DISPLAY, 8, "italic"),
+                        anchor="w", justify="left", wraplength=680
+                        ).pack(fill="x", pady=(0, 6))
+
+                # ─── "Around the headline" section if we have it ──────────
+                ah = tl.get("around_headline")
+                if ah:
+                    ah_frame = tk.Frame(body, bg=PALETTE["bg_alt"])
+                    ah_frame.pack(fill="x", pady=(0, 8))
+                    tk.Label(ah_frame, text="  AROUND THE HEADLINE  ",
+                             bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
+                             font=(FONT_DISPLAY, 8, "bold")
+                             ).pack(anchor="w", padx=8, pady=(6, 2))
+
+                    row = tk.Frame(ah_frame, bg=PALETTE["bg_alt"])
+                    row.pack(fill="x", padx=8, pady=(0, 6))
+
+                    before_dt = datetime.fromtimestamp(ah["before_ts"], ET_ZONE)
+                    at_dt = datetime.fromtimestamp(ah["at_ts"], ET_ZONE)
+                    bp, ap = ah["before_price"], ah["at_price"]
+                    delta = ap - bp
+                    delta_pct = (delta / bp * 100) if bp else 0
+                    delta_color = PALETTE["accent_2"] if delta_pct >= 0 else PALETTE["danger"]
+                    sign = "+" if delta_pct >= 0 else ""
+
+                    tk.Label(row, text="Before:", bg=PALETTE["bg_alt"],
+                             fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 9),
+                             width=8, anchor="w").pack(side="left")
+                    tk.Label(row, text=f"${bp:.2f}", bg=PALETTE["bg_alt"],
+                             fg=PALETTE["text"], font=(FONT_DISPLAY, 10, "bold")
+                             ).pack(side="left")
+                    tk.Label(row, text=f" at {before_dt.strftime('%I:%M %p')}",
+                             bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
+                             font=(FONT_DISPLAY, 8)).pack(side="left")
+
+                    tk.Label(row, text="  →  ", bg=PALETTE["bg_alt"],
+                             fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 10, "bold")
+                             ).pack(side="left")
+
+                    tk.Label(row, text=f"${ap:.2f}", bg=PALETTE["bg_alt"],
+                             fg=PALETTE["text"], font=(FONT_DISPLAY, 10, "bold")
+                             ).pack(side="left")
+                    tk.Label(row, text=f" at {at_dt.strftime('%I:%M %p')}",
+                             bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
+                             font=(FONT_DISPLAY, 8)).pack(side="left")
+                    tk.Label(row, text=f"   {sign}{delta_pct:.2f}% ({sign}${delta:.2f})",
+                             bg=PALETTE["bg_alt"], fg=delta_color,
+                             font=(FONT_DISPLAY, 9, "bold")
+                             ).pack(side="left", padx=(8, 0))
+
+                # ─── Headline price reference ─────────────────────────────
+                if headline_info:
+                    hp = headline_info["price"]
+                    try:
+                        captured = datetime.fromisoformat(headline_info["captured_at"])
+                        captured_str = captured.astimezone(ET_ZONE).strftime("%a %b %d, %I:%M %p ET")
+                    except Exception:
+                        captured_str = "captured time"
+                    tk.Label(body,
+                        text=f"📌  Headline-time price: ${hp:.2f}  ·  captured {captured_str}",
+                        bg=PALETTE["panel"], fg=PALETTE["text_dim"],
+                        font=(FONT_DISPLAY, 9), anchor="w"
+                        ).pack(fill="x", pady=(0, 8))
+
+                # ─── Session blocks (chronological, oldest → newest) ─────
+                tk.Label(body, text="SESSIONS  (oldest → newest)",
+                         bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                         font=(FONT_DISPLAY, 8, "bold"), anchor="w"
+                         ).pack(fill="x", pady=(4, 4))
+
+                for sess in sessions:
+                    self._render_session_bar(body, sess)
+
+                # Footnote
+                tk.Label(body,
+                    text=f"All times Eastern. Last update: {datetime.now(ET_ZONE).strftime('%I:%M:%S %p ET')}",
+                    bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                    font=(FONT_DISPLAY, 8, "italic"), anchor="w"
+                    ).pack(fill="x", pady=(8, 0))
+
+            try:
+                body.after(0, render)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _render_session_bar(self, parent, sess):
+        """Render one session as a horizontal block: pre-market / regular / after-hours."""
+        kind = sess["kind"]
+        kind_label = {
+            "premarket":  "PRE-MARKET",
+            "regular":    "REGULAR HOURS",
+            "afterhours": "AFTER HOURS",
+        }.get(kind, kind.upper())
+        kind_color = {
+            "premarket":  "#f59e0b",   # amber — thin liquidity
+            "regular":    PALETTE["accent"],
+            "afterhours": "#a855f7",   # purple — thin liquidity
+        }.get(kind, PALETTE["text_mute"])
+
+        op, cp = sess["open_price"], sess["close_price"]
+        delta = cp - op
+        delta_pct = (delta / op * 100) if op else 0
+        delta_color = PALETTE["accent_2"] if delta_pct >= 0 else PALETTE["danger"]
+        sign = "+" if delta_pct >= 0 else ""
+
+        row = tk.Frame(parent, bg=PALETTE["panel_alt"])
+        row.pack(fill="x", pady=2)
+
+        # Color stripe on the left to indicate session type
+        tk.Frame(row, bg=kind_color, width=4).pack(side="left", fill="y")
+
+        # Date + kind label
+        meta = tk.Frame(row, bg=PALETTE["panel_alt"])
+        meta.pack(side="left", padx=(8, 12), pady=6)
+        tk.Label(meta, text=kind_label, bg=PALETTE["panel_alt"],
+                 fg=kind_color, font=(FONT_DISPLAY, 8, "bold"),
+                 anchor="w").pack(anchor="w")
+        tk.Label(meta, text=sess["date_label"], bg=PALETTE["panel_alt"],
+                 fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 8),
+                 anchor="w").pack(anchor="w")
+
+        # Open → close
+        prices = tk.Frame(row, bg=PALETTE["panel_alt"])
+        prices.pack(side="left", padx=(0, 12), pady=6)
+        open_dt = datetime.fromtimestamp(sess["open_ts"], ET_ZONE)
+        close_dt = datetime.fromtimestamp(sess["close_ts"], ET_ZONE)
+        tk.Label(prices, text=f"${op:.2f}", bg=PALETTE["panel_alt"],
+                 fg=PALETTE["text"], font=(FONT_DISPLAY, 10, "bold")
+                 ).pack(side="left")
+        tk.Label(prices, text=f" {open_dt.strftime('%I:%M')}",
+                 bg=PALETTE["panel_alt"], fg=PALETTE["text_mute"],
+                 font=(FONT_DISPLAY, 8)).pack(side="left")
+        tk.Label(prices, text="  →  ", bg=PALETTE["panel_alt"],
+                 fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 10)
+                 ).pack(side="left")
+        tk.Label(prices, text=f"${cp:.2f}", bg=PALETTE["panel_alt"],
+                 fg=PALETTE["text"], font=(FONT_DISPLAY, 10, "bold")
+                 ).pack(side="left")
+        tk.Label(prices, text=f" {close_dt.strftime('%I:%M')}",
+                 bg=PALETTE["panel_alt"], fg=PALETTE["text_mute"],
+                 font=(FONT_DISPLAY, 8)).pack(side="left")
+
+        # High/low + % change
+        stats = tk.Frame(row, bg=PALETTE["panel_alt"])
+        stats.pack(side="left", padx=(0, 12), pady=6)
+        tk.Label(stats, text=f"H ${sess['high']:.2f}  L ${sess['low']:.2f}",
+                 bg=PALETTE["panel_alt"], fg=PALETTE["text_mute"],
+                 font=(FONT_DISPLAY, 8)).pack(side="left")
+
+        tk.Label(row, text=f"  {sign}{delta_pct:.2f}%  ",
+                 bg=delta_color, fg="#0a0e1c",
+                 font=(FONT_DISPLAY, 10, "bold")
+                 ).pack(side="right", padx=8, pady=8)
+
+        if sess.get("is_current"):
+            tk.Label(row, text="  LIVE  ", bg=PALETTE["accent_2"], fg="#0a0e1c",
+                     font=(FONT_DISPLAY, 7, "bold")
+                     ).pack(side="right", padx=(0, 6))
 
     def _daily_perf_card(self, parent, ticker):
         """End-of-day performance summary for one ticker. Async fetch.
