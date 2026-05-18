@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.7.0"
+APP_VERSION = "3.8.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -727,6 +727,7 @@ def fetch_price_timeline(ticker, story_time_utc=None):
             "around_headline": around_headline,
             "extended_supported": extended_supported,
             "date_iso": date_iso,
+            "candles": candles,  # raw minute candles for event-chain building
         }
 
     except (HTTPError, URLError) as e:
@@ -735,6 +736,195 @@ def fetch_price_timeline(ticker, story_time_utc=None):
     except Exception as e:
         LOGGER.warning(f"price timeline unexpected error for {ticker}: {e}")
         return None
+
+
+def build_news_event_chain(timeline, story_time_utc):
+    """
+    Build a chronological event chain anchored on a news drop time.
+
+    Returns a list of event dicts, each with:
+        {label: str, time_et: datetime, price: float, pct_from_prev_close: float|None,
+         kind: 'prior_close'|'prior_afterhours'|'news_drop'|'session_open'|
+               'session_close'|'current'|'spot', emphasized: bool}
+
+    The chain shows:
+      1. Prior regular-hours close (the baseline)
+      2. Prior after-hours close (if extended hours exist)
+      3. NEWS BREAKS — closest price to the headline drop
+      4. Pre-market open, current pre-market price (if applicable)
+      5. Regular open (if market has opened since news)
+      6. Current / latest price
+    """
+    if not timeline or not story_time_utc:
+        return []
+    candles = timeline.get("candles") or []
+    if not candles:
+        return []
+
+    story_ts = int(story_time_utc.timestamp())
+
+    def classify(ts):
+        dt = datetime.fromtimestamp(ts, ET_ZONE)
+        hm = dt.hour * 60 + dt.minute
+        if 4 * 60 <= hm < 9 * 60 + 30:   return "premarket"
+        if 9 * 60 + 30 <= hm < 16 * 60:  return "regular"
+        if 16 * 60 <= hm < 20 * 60:      return "afterhours"
+        return "off"
+
+    # Split candles into before-news vs after-news
+    before = [c for c in candles if c["ts"] <= story_ts]
+    after = [c for c in candles if c["ts"] > story_ts]
+
+    events = []
+
+    def add_event(label, ts, price, kind, baseline=None, emphasized=False):
+        dt = datetime.fromtimestamp(ts, ET_ZONE)
+        pct = None
+        if baseline and baseline > 0 and price:
+            pct = (price - baseline) / baseline * 100
+        events.append({
+            "label": label,
+            "time_et": dt,
+            "price": float(price),
+            "pct_from_baseline": pct,
+            "kind": kind,
+            "emphasized": emphasized,
+        })
+
+    # ─── 1. Prior regular-hours close (baseline) ──────────────────────────
+    # Find the most recent 'regular' candle before story_ts.
+    prior_regular_close = None
+    for c in reversed(before):
+        if classify(c["ts"]) == "regular":
+            prior_regular_close = c
+            break
+
+    if prior_regular_close:
+        add_event(
+            "Prior regular close",
+            prior_regular_close["ts"],
+            prior_regular_close["close"],
+            "prior_close",
+            baseline=None,
+            emphasized=True,
+        )
+
+    baseline_price = prior_regular_close["close"] if prior_regular_close else None
+
+    # ─── 2. Prior after-hours close (if exists between prior_regular_close and news) ──
+    prior_afterhours_close = None
+    if prior_regular_close:
+        for c in reversed(before):
+            if c["ts"] <= prior_regular_close["ts"]:
+                break
+            if classify(c["ts"]) == "afterhours":
+                prior_afterhours_close = c
+                break
+
+    if prior_afterhours_close:
+        add_event(
+            "Prior after-hours close",
+            prior_afterhours_close["ts"],
+            prior_afterhours_close["close"],
+            "prior_afterhours",
+            baseline=baseline_price,
+        )
+
+    # ─── 3. NEWS BREAKS — closest candle near story_ts ────────────────────
+    news_price = None
+    news_ts = story_ts
+    if before:
+        nearest = before[-1]
+        news_price = nearest["close"]
+        news_ts = nearest["ts"]
+    elif after:
+        nearest = after[0]
+        news_price = nearest["close"]
+        news_ts = nearest["ts"]
+
+    if news_price:
+        add_event(
+            "NEWS BREAKS",
+            news_ts,
+            news_price,
+            "news_drop",
+            baseline=baseline_price,
+            emphasized=True,
+        )
+
+    # ─── 4. Pre-market activity after news (if applicable) ────────────────
+    post_news_premarket = [c for c in after if classify(c["ts"]) == "premarket"]
+    if post_news_premarket:
+        # First pre-market candle after news
+        first_pm = post_news_premarket[0]
+        if first_pm["ts"] != news_ts:
+            add_event(
+                "Pre-market resumes",
+                first_pm["ts"],
+                first_pm["close"],
+                "session_open",
+                baseline=baseline_price,
+            )
+
+    # ─── 5. Regular session open (if reached) ─────────────────────────────
+    post_news_regular = [c for c in after if classify(c["ts"]) == "regular"]
+    if post_news_regular:
+        first_reg = post_news_regular[0]
+        add_event(
+            "Regular open",
+            first_reg["ts"],
+            first_reg["close"],
+            "session_open",
+            baseline=baseline_price,
+            emphasized=True,
+        )
+
+    # ─── 6. Regular session close (if reached) ────────────────────────────
+    if post_news_regular and len(post_news_regular) > 1:
+        # Was the most recent candle in regular hours, or have we moved on to AH?
+        last_candle = candles[-1]
+        if classify(last_candle["ts"]) != "regular":
+            # Regular session already ended — find its last candle
+            last_reg = post_news_regular[-1]
+            add_event(
+                "Regular close",
+                last_reg["ts"],
+                last_reg["close"],
+                "session_close",
+                baseline=baseline_price,
+            )
+
+    # ─── 7. After-hours activity (if applicable) ──────────────────────────
+    post_news_afterhours = [c for c in after if classify(c["ts"]) == "afterhours"]
+    if post_news_afterhours:
+        first_ah = post_news_afterhours[0]
+        add_event(
+            "After-hours opens",
+            first_ah["ts"],
+            first_ah["close"],
+            "session_open",
+            baseline=baseline_price,
+        )
+
+    # ─── 8. Current / latest price ────────────────────────────────────────
+    if candles:
+        latest = candles[-1]
+        # Only add if it's not already covered by news_drop
+        already_covered = any(e["kind"] == "current" or
+                              (abs(e["time_et"].timestamp() - latest["ts"]) < 60
+                               and e["kind"] != "news_drop")
+                              for e in events)
+        if not already_covered and latest["ts"] != news_ts:
+            add_event(
+                "Current",
+                latest["ts"],
+                latest["close"],
+                "current",
+                baseline=baseline_price,
+                emphasized=True,
+            )
+
+    return events
 
 
 def market_is_closed_for_today():
@@ -2537,6 +2727,8 @@ class StoryDetailPanel(tk.Frame):
             tl = fetch_price_timeline(ticker, story_time_utc=story_published)
             story_id = self.story.get("db_id") or self._find_story_id()
             headline_info = db_get_headline_price(story_id, ticker) if story_id else None
+            # Build the news-anchored chronological chain
+            event_chain = build_news_event_chain(tl, story_published) if (tl and story_published) else []
 
             def render():
                 try:
@@ -2553,9 +2745,6 @@ class StoryDetailPanel(tk.Frame):
                     return
 
                 sessions = tl["sessions"]
-
-                # Build a single horizontal row of session bars
-                # Each session = a colored block with kind label, open price, close price, % change
                 ext_supported = tl.get("extended_supported", False)
                 if not ext_supported:
                     tk.Label(body,
@@ -2566,53 +2755,7 @@ class StoryDetailPanel(tk.Frame):
                         anchor="w", justify="left", wraplength=680
                         ).pack(fill="x", pady=(0, 6))
 
-                # ─── "Around the headline" section if we have it ──────────
-                ah = tl.get("around_headline")
-                if ah:
-                    ah_frame = tk.Frame(body, bg=PALETTE["bg_alt"])
-                    ah_frame.pack(fill="x", pady=(0, 8))
-                    tk.Label(ah_frame, text="  AROUND THE HEADLINE  ",
-                             bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
-                             font=(FONT_DISPLAY, 8, "bold")
-                             ).pack(anchor="w", padx=8, pady=(6, 2))
-
-                    row = tk.Frame(ah_frame, bg=PALETTE["bg_alt"])
-                    row.pack(fill="x", padx=8, pady=(0, 6))
-
-                    before_dt = datetime.fromtimestamp(ah["before_ts"], ET_ZONE)
-                    at_dt = datetime.fromtimestamp(ah["at_ts"], ET_ZONE)
-                    bp, ap = ah["before_price"], ah["at_price"]
-                    delta = ap - bp
-                    delta_pct = (delta / bp * 100) if bp else 0
-                    delta_color = PALETTE["accent_2"] if delta_pct >= 0 else PALETTE["danger"]
-                    sign = "+" if delta_pct >= 0 else ""
-
-                    tk.Label(row, text="Before:", bg=PALETTE["bg_alt"],
-                             fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 9),
-                             width=8, anchor="w").pack(side="left")
-                    tk.Label(row, text=f"${bp:.2f}", bg=PALETTE["bg_alt"],
-                             fg=PALETTE["text"], font=(FONT_DISPLAY, 10, "bold")
-                             ).pack(side="left")
-                    tk.Label(row, text=f" at {before_dt.strftime('%I:%M %p')}",
-                             bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
-                             font=(FONT_DISPLAY, 8)).pack(side="left")
-
-                    tk.Label(row, text="  →  ", bg=PALETTE["bg_alt"],
-                             fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 10, "bold")
-                             ).pack(side="left")
-
-                    tk.Label(row, text=f"${ap:.2f}", bg=PALETTE["bg_alt"],
-                             fg=PALETTE["text"], font=(FONT_DISPLAY, 10, "bold")
-                             ).pack(side="left")
-                    tk.Label(row, text=f" at {at_dt.strftime('%I:%M %p')}",
-                             bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
-                             font=(FONT_DISPLAY, 8)).pack(side="left")
-                    tk.Label(row, text=f"   {sign}{delta_pct:.2f}% ({sign}${delta:.2f})",
-                             bg=PALETTE["bg_alt"], fg=delta_color,
-                             font=(FONT_DISPLAY, 9, "bold")
-                             ).pack(side="left", padx=(8, 0))
-
-                # ─── Headline price reference ─────────────────────────────
+                # ─── Headline price reference ────────────────────────────
                 if headline_info:
                     hp = headline_info["price"]
                     try:
@@ -2621,16 +2764,33 @@ class StoryDetailPanel(tk.Frame):
                     except Exception:
                         captured_str = "captured time"
                     tk.Label(body,
-                        text=f"📌  Headline-time price: ${hp:.2f}  ·  captured {captured_str}",
+                        text=f"📌  Headline-time price (captured by scanner): ${hp:.2f}  ·  {captured_str}",
                         bg=PALETTE["panel"], fg=PALETTE["text_dim"],
                         font=(FONT_DISPLAY, 9), anchor="w"
                         ).pack(fill="x", pady=(0, 8))
 
-                # ─── Session blocks (chronological, oldest → newest) ─────
-                tk.Label(body, text="SESSIONS  (oldest → newest)",
+                # ─── EVENT CHAIN — chronological price chain around the news drop ───
+                if event_chain:
+                    tk.Label(body, text="PRICE CHAIN  (anchored on news drop)",
+                             bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                             font=(FONT_DISPLAY, 8, "bold"), anchor="w"
+                             ).pack(fill="x", pady=(4, 4))
+                    for evt in event_chain:
+                        self._render_chain_event(body, evt)
+                else:
+                    tk.Label(body,
+                        text="Couldn't build a price chain — the news may be too old "
+                             "(Yahoo's minute-level history only goes back ~5 trading days).",
+                        bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                        font=(FONT_DISPLAY, 9, "italic"),
+                        anchor="w", justify="left", wraplength=680
+                        ).pack(fill="x", pady=(0, 6))
+
+                # ─── Session block summary (for full-session context) ────
+                tk.Label(body, text="\nSESSIONS  (oldest → newest)",
                          bg=PALETTE["panel"], fg=PALETTE["text_mute"],
                          font=(FONT_DISPLAY, 8, "bold"), anchor="w"
-                         ).pack(fill="x", pady=(4, 4))
+                         ).pack(fill="x", pady=(8, 4))
 
                 for sess in sessions:
                     self._render_session_bar(body, sess)
@@ -2648,6 +2808,65 @@ class StoryDetailPanel(tk.Frame):
                 pass
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _render_chain_event(self, parent, evt):
+        """Render one event in the news-anchored price chain.
+        Events are stacked vertically with a connecting line between them."""
+        is_news = evt["kind"] == "news_drop"
+        is_emphasis = evt.get("emphasized", False)
+
+        # Color: news = warning yellow; emphasized = accent; otherwise muted
+        if is_news:
+            bg_color = PALETTE["warn"]
+            fg_color = "#0a0e1c"
+            label_fg = "#0a0e1c"
+        elif is_emphasis:
+            bg_color = PALETTE["panel_alt"]
+            fg_color = PALETTE["text"]
+            label_fg = PALETTE["accent_hi"]
+        else:
+            bg_color = PALETTE["panel_alt"]
+            fg_color = PALETTE["text"]
+            label_fg = PALETTE["text_mute"]
+
+        row = tk.Frame(parent, bg=bg_color)
+        row.pack(fill="x", pady=1)
+
+        # Time column
+        time_str = evt["time_et"].strftime("%a %b %d  %I:%M %p ET")
+        tk.Label(row, text=time_str, bg=bg_color,
+                 fg=label_fg if is_news else PALETTE["text_mute"],
+                 font=(FONT_DISPLAY, 9), width=23, anchor="w"
+                 ).pack(side="left", padx=(8, 0), pady=6)
+
+        # Label
+        label_text = evt["label"]
+        if is_news:
+            label_text = f"⚡ {label_text}"
+        tk.Label(row, text=label_text, bg=bg_color,
+                 fg=label_fg,
+                 font=(FONT_DISPLAY, 10, "bold" if is_emphasis or is_news else "normal"),
+                 width=22, anchor="w"
+                 ).pack(side="left", pady=6)
+
+        # Price
+        tk.Label(row, text=f"${evt['price']:.2f}", bg=bg_color,
+                 fg=fg_color,
+                 font=(FONT_DISPLAY, 11 if is_emphasis or is_news else 10, "bold"),
+                 anchor="w"
+                 ).pack(side="left", pady=6)
+
+        # % change from baseline (prior regular close)
+        if evt.get("pct_from_baseline") is not None:
+            pct = evt["pct_from_baseline"]
+            pct_color = PALETTE["accent_2"] if pct >= 0 else PALETTE["danger"]
+            if is_news:
+                pct_color = "#0a0e1c"
+            sign = "+" if pct >= 0 else ""
+            tk.Label(row, text=f"   ({sign}{pct:.2f}% from prior close)",
+                     bg=bg_color, fg=pct_color,
+                     font=(FONT_DISPLAY, 9, "bold")
+                     ).pack(side="left", pady=6)
 
     def _render_session_bar(self, parent, sess):
         """Render one session as a horizontal block: pre-market / regular / after-hours."""
