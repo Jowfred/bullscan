@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.8.1"
+APP_VERSION = "3.9.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -1958,17 +1958,46 @@ _RE_ROUNDUP = re.compile(
     re.IGNORECASE,
 )
 
+# Going-private / private-company language. A company being TAKEN private can no
+# longer be bought on the open market once the deal closes — not a tradeable
+# bullish opportunity for a retail buyer. Also catches purely private firms.
+_RE_GOING_PRIVATE = re.compile(
+    r"\b(?:to\s+(?:go|be\s+taken)\s+private|going[-\s]private\s+transaction|"
+    r"taken\s+private|delisting\s+(?:and|&)?\s*going\s+private)\b",
+    re.IGNORECASE,
+)
+
+# Private-company funding events — no public ticker exists to trade.
+_RE_PRIVATE_FUNDING = re.compile(
+    r"\b(?:series\s+[a-f]\s+(?:funding|round|financing)|"
+    r"seed\s+(?:round|funding)|pre-seed|"
+    r"raises?\s+\$[\d.,]+\s*(?:million|billion|m|b)\s+in\s+(?:series|seed|venture|funding)|"
+    r"closes?\s+\$[\d.,]+\s*(?:million|billion|m|b)\s+(?:series|seed|funding\s+round)|"
+    r"venture\s+(?:capital\s+)?(?:round|funding)|"
+    r"privately[-\s]held\s+company)\b",
+    re.IGNORECASE,
+)
+
+# OTC / pink-sheet markers — technically public but barely tradeable, high
+# pump-and-dump risk. Filter unless the user explicitly wants them.
+_RE_OTC_MARKER = re.compile(
+    r"\(\s*(?:OTC|OTCMKTS|OTCQB|OTCQX|PINK|OTCPK)\s*:\s*[A-Z]{1,6}\s*\)",
+    re.IGNORECASE,
+)
+
 
 def is_junk_story(title, summary=""):
     """
     Returns (is_junk: bool, reason: str). Filter out clickbait, generic
-    market commentary, opinion pieces, sponsored content, and listicles
+    market commentary, opinion pieces, sponsored content, listicles, and
+    stories about non-tradeable (private / going-private / OTC) companies
     BEFORE we waste time scoring them.
     """
     if not title or len(title) < 10:
         return True, "too-short title"
 
     title_clean = title.strip()
+    combined = f"{title_clean}  {summary or ''}"
 
     if _RE_SPONSORED.search(title_clean) or _RE_SPONSORED.search(summary or ""):
         return True, "sponsored content"
@@ -1979,13 +2008,21 @@ def is_junk_story(title, summary=""):
     if _RE_ROUNDUP.search(title_clean):
         return True, "roundup / movers list"
 
-    # Generic market commentary — only filter if NO specific company is named.
-    # We catch this in the no-ticker filter later, but quick-reject obvious ones.
     if _RE_MARKET_COMMENTARY.match(title_clean):
         return True, "generic market commentary"
 
     if _RE_OPINION.search(title_clean):
         return True, "opinion / analysis piece"
+
+    # ─── Non-tradeable company filters ───
+    if _RE_GOING_PRIVATE.search(combined):
+        return True, "going-private deal (won't be tradeable)"
+
+    if _RE_PRIVATE_FUNDING.search(combined):
+        return True, "private company funding (no public ticker)"
+
+    if _RE_OTC_MARKER.search(combined):
+        return True, "OTC / pink-sheet listing"
 
     return False, ""
 
@@ -4062,6 +4099,17 @@ class PreMarketScanner(tk.Tk):
                                 q = fetch_quote(t)
                                 if q:
                                     db_save_snapshot(story_id, t, q, "headline")
+
+            # ─── Drop non-tradeable stories ───
+            # If none of our 5 ticker-detection strategies found a public,
+            # exchange-listed ticker, the story is almost certainly about a
+            # private company (or something untradeable). Drop it — unless the
+            # user explicitly pinned it. This is the strongest private-company filter.
+            before_count = len(stories)
+            stories = [s for s in stories if s.get("tickers") or s.get("pinned")]
+            no_ticker_dropped = before_count - len(stories)
+            if no_ticker_dropped:
+                LOGGER.info(f"Dropped {no_ticker_dropped} stories with no tradeable ticker")
 
             stories.sort(
                 key=lambda x: x.get("published") or datetime.now(timezone.utc),
