@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.8.0"
+APP_VERSION = "3.8.1"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -4069,54 +4069,69 @@ class PreMarketScanner(tk.Tk):
             )
 
             # Merge with persisted stories so we don't lose pinned ones that have
-            # since fallen off the RSS feeds.
-            persisted = db_load_stories(days_back=7)  # load up to a week for pinned
+            # since fallen off the RSS feeds. Load only a short window — pinned
+            # stories are kept regardless, but we don't want a week of old
+            # non-pinned stories flooding back in.
+            persisted = db_load_stories(days_back=3)
             new_keys = {s["story_key"] for s in stories}
             current_session = session_date_for(datetime.now(timezone.utc))
-            today_market_open_passed = _market_open_passed_today()
+            now_et = datetime.now(ET_ZONE)
             today_market_closed = market_is_closed_for_today()
 
-            # ─── Clean up the live (RSS) story list ───
-            # Once today's market has closed, today's pre-market stories are
-            # no longer actionable. Drop anything older than today's open unless
-            # the user has pinned it.
-            if today_market_closed:
-                now_et = datetime.now(ET_ZONE)
-                # Cutoff: today's market open at 9:30 AM ET
-                today_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-                today_open_utc = today_open.astimezone(timezone.utc)
+            def is_actionable_now(story_dict):
+                """A non-pinned story is 'actionable' (worth showing) only if it
+                belongs to the session the user currently cares about:
+                  - Before today's close: stories from today's session
+                  - After today's close: only stories published AFTER today's close
+                    (tonight's after-hours news = tomorrow's pre-market catalysts)
+                Anything older is stale and gets dropped immediately."""
+                pub = story_dict.get("published")
+                if pub is None:
+                    return False
+                if pub.tzinfo is None:
+                    pub = pub.replace(tzinfo=timezone.utc)
 
-                kept = []
-                stale_count = 0
-                for s in stories:
-                    if s.get("pinned"):
-                        kept.append(s)
-                        continue
-                    pub = s.get("published")
-                    if pub and pub < today_open_utc:
-                        stale_count += 1
-                        continue
+                if today_market_closed:
+                    # Only keep stories published after today's 4 PM ET close
+                    close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+                    if now_et.weekday() >= 5:
+                        # Weekend — keep anything from the last 48h (Friday close onward)
+                        return pub >= (datetime.now(timezone.utc) - timedelta(hours=48))
+                    return pub >= close_et.astimezone(timezone.utc)
+                else:
+                    # Market not yet closed today — keep stories from the current session.
+                    # Current session started at 4 AM ET today (pre-market open).
+                    session_start_et = now_et.replace(hour=4, minute=0, second=0, microsecond=0)
+                    if now_et.hour < 4:
+                        # Before 4 AM — session belongs to prior day; allow last 12h
+                        return pub >= (datetime.now(timezone.utc) - timedelta(hours=12))
+                    return pub >= session_start_et.astimezone(timezone.utc)
+
+            # ─── Clean up the LIVE (RSS) story list ───
+            # Drop any non-pinned live story that isn't actionable for the current session.
+            kept = []
+            stale_count = 0
+            for s in stories:
+                if s.get("pinned"):
                     kept.append(s)
-                if stale_count:
-                    LOGGER.info(f"Post-close cleanup: dropped {stale_count} stale pre-market stories")
-                stories = kept
+                    continue
+                if is_actionable_now(s):
+                    kept.append(s)
+                else:
+                    stale_count += 1
+            if stale_count:
+                LOGGER.info(f"Cleanup: dropped {stale_count} stale live stories")
+            stories = kept
 
+            # ─── Merge in persisted stories ───
             for p in persisted:
                 if p["story_key"] in new_keys:
                     continue
                 is_pinned = p["story_key"] in pinned_keys_snapshot
 
-                # Apply the "remove old stories" rule:
-                # - If pinned: always keep
-                # - If from a previous session AND today's market open has passed: drop
-                # - If from current session BUT today's market has closed: drop
-                #   (today's pre-market stories are no longer actionable after close)
-                if not is_pinned:
-                    same_session = p.get("session_date") == current_session
-                    if not same_session and today_market_open_passed:
-                        continue
-                    if same_session and today_market_closed:
-                        continue
+                # Pinned stories always come back. Non-pinned only if still actionable.
+                if not is_pinned and not is_actionable_now(p):
+                    continue
 
                 # If this persisted story was saved before the better ticker extractor
                 # was introduced, its tickers list may be empty. Re-extract now.
