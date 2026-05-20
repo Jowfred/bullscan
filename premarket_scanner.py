@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.9.0"
+APP_VERSION = "3.10.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -2238,6 +2238,286 @@ def conviction_label(score, has_bearish):
         return "WEAK SIGNAL", "#f97316", "Minor bullish hints, but the signal is weak."
     return "NO SIGNAL", "#6b7280", "No meaningful bullish catalyst found in this headline."
 
+# ─────────────────────── TRADER'S ANALYSIS FRAMEWORK ──────────────────────────
+# Generates a structured, senior-trader-style framework for a story. This does
+# NOT make buy/sell calls or invent "actionable" conclusions. It organizes facts
+# the app already has and surfaces the questions a disciplined trader would ask.
+
+# Lightweight sector inference from keywords in the headline/summary.
+SECTOR_KEYWORDS = {
+    "Biotech / Pharma": [
+        r"\bfda\b", r"\bclinical\b", r"\bphase\s+[123]\b", r"\bdrug\b", r"\btherap",
+        r"\bpharma", r"\bbiotech", r"\bvaccine", r"\boncolog", r"\btrial\b",
+        r"\bprimary\s+endpoint", r"\btreatment\b", r"\bbreakthrough\s+therapy",
+    ],
+    "Technology / Software": [
+        r"\bsoftware\b", r"\bcloud\b", r"\bsaas\b", r"\bai\b", r"\bartificial\s+intelligence",
+        r"\bsemiconductor", r"\bchip", r"\bdata\s+center", r"\bcyber", r"\bplatform\b",
+    ],
+    "Energy": [
+        r"\boil\b", r"\bgas\b", r"\bcrude\b", r"\benergy\b", r"\bsolar\b", r"\bdrilling",
+        r"\bpipeline", r"\brenewable", r"\bbarrel", r"\bopec\b",
+    ],
+    "Defense / Aerospace": [
+        r"\bdefense\b", r"\bpentagon\b", r"\bmilitary\b", r"\bdod\b", r"\baerospace",
+        r"\bmissile", r"\bcontract\s+award", r"\bnavy\b", r"\barmy\b", r"\bair\s+force",
+    ],
+    "Financials": [
+        r"\bbank\b", r"\bbancorp", r"\blending", r"\bmortgage", r"\binsurance",
+        r"\bfintech", r"\bpayments?\b", r"\bcredit\b", r"\bdeposits?\b",
+    ],
+    "Consumer / Retail": [
+        r"\bretail", r"\bconsumer", r"\bstore", r"\brestaurant", r"\bsame[-\s]store",
+        r"\be-?commerce", r"\bbrand", r"\bapparel", r"\bfood\b",
+    ],
+    "Healthcare Services": [
+        r"\bhospital", r"\binsurer", r"\bmedicare", r"\bmedicaid", r"\bhealth\s+plan",
+        r"\bmedical\s+device", r"\bdiagnostic",
+    ],
+    "Industrials": [
+        r"\bmanufactur", r"\bindustrial", r"\bmachinery", r"\bequipment\b",
+        r"\bsupply\s+chain", r"\blogistics", r"\bfreight",
+    ],
+}
+
+def infer_sector(text):
+    """Best-effort sector inference from text. Returns sector name or 'Unclear'."""
+    if not text:
+        return "Unclear"
+    tl = text.lower()
+    scores = {}
+    for sector, patterns in SECTOR_KEYWORDS.items():
+        hits = sum(1 for p in patterns if re.search(p, tl))
+        if hits:
+            scores[sector] = hits
+    if not scores:
+        return "Unclear"
+    return max(scores, key=scores.get)
+
+
+# Catalyst-specific questions a trader should ask before acting.
+CATALYST_QUESTIONS = {
+    "Earnings Beat": [
+        "Was the beat meaningful, or barely above estimates? (A 1-2% beat is noise.)",
+        "Did revenue beat too, or just EPS? (EPS-only beats can be cost-cutting, not growth.)",
+        "Did guidance for next quarter go up, down, or stay flat? Forward guidance often matters more than the beat.",
+        "Had the stock already run up into earnings? (If so, the beat may be priced in.)",
+    ],
+    "Guidance Raise": [
+        "How big is the raise, and off what base? (A tiny raise after a prior cut isn't bullish.)",
+        "Is the raise organic or driven by acquisitions / one-time items?",
+        "Does it beat what analysts already expected, or just match the whisper number?",
+    ],
+    "FDA Approval": [
+        "Is this approval for a major indication or a narrow / secondary one?",
+        "Was approval widely expected? (If the PDUFA date was known, it may be priced in.)",
+        "What's the addressable market and competition for this drug?",
+        "What's the company's cash position — can they fund the launch?",
+    ],
+    "Contract Win": [
+        "How big is the contract relative to the company's annual revenue?",
+        "Is it firm revenue or a 'potential value' / IDIQ ceiling that may never be fully funded?",
+        "Over how many years does the contract pay out?",
+        "Is this a new customer or a renewal that was already in the numbers?",
+    ],
+    "Analyst Upgrade": [
+        "Which firm, and what's their track record on this name?",
+        "Is this a single upgrade or part of a broader shift in sentiment?",
+        "How much upside does the new price target imply from the current price?",
+        "Analyst upgrades often LAG the move — has the stock already run?",
+    ],
+    "Partnership": [
+        "Is there actual revenue / economics attached, or is it a vague 'strategic' announcement?",
+        "Who's the bigger partner, and who benefits more?",
+        "Is this binding, or just a letter of intent / MOU?",
+    ],
+    "M&A / Buyout": [
+        "Is the company the ACQUIRER or the TARGET? (Targets usually pop; acquirers can drop.)",
+        "What's the offer price vs. the current price? (That spread is the real signal.)",
+        "Is the deal all-cash, all-stock, or mixed? Cash deals are more certain.",
+        "Is it a binding 'definitive agreement' or just 'intent' / 'exploring'?",
+        "Is there regulatory / antitrust risk that could block the deal?",
+    ],
+    "Buyback / Dividend": [
+        "How big is the buyback relative to market cap? (A small buyback is symbolic.)",
+        "Is it funded from cash flow or new debt?",
+        "For microcaps: is this propping up a weak stock rather than returning real value?",
+        "Authorizations aren't purchases — will they actually execute it?",
+    ],
+    "Patent / IP": [
+        "Does this patent protect a material product, or is it one of thousands?",
+        "Is there actual revenue tied to it, or is it speculative?",
+    ],
+    "Insider Buying": [
+        "How large is the purchase relative to the insider's net worth / salary?",
+        "Is it an open-market buy (bullish) or an option exercise (neutral)?",
+        "Are multiple insiders buying, or just one?",
+    ],
+}
+
+GENERIC_QUESTIONS = [
+    "Is this news genuinely new, or a re-report of something already known?",
+    "What's the float and average volume? Thin floats move violently on small news.",
+    "Has the stock already moved on this? Check the price chain above.",
+    "What's your time horizon and risk tolerance — and where would you be wrong?",
+]
+
+
+def generate_trader_analysis(story, price_data=None):
+    """
+    Build a structured senior-trader-style framework for a story.
+    Returns a dict of sections. NONE of these contain buy/sell recommendations —
+    they organize facts and surface questions.
+
+    Keys returned:
+      'claim_vs_implication': str
+      'sentiment_assessment': (verdict_str, detail_str, color)
+      'sector': str
+      'questions': list[str]
+      'red_flags': list[str]
+      'missing_info': list[str]
+      'bottom_line': str
+    """
+    title = story.get("title", "")
+    summary = story.get("summary", "")
+    text = f"{title}\n{summary}"
+    score = story.get("score", 0)
+    catalysts = story.get("catalysts", [])
+    warnings = story.get("warnings", [])
+    tickers = story.get("tickers", [])
+
+    out = {}
+
+    # ─── 1. What the headline claims vs. implies ───
+    claim_parts = []
+    if catalysts:
+        claim_parts.append(
+            f"The scanner tagged this as: {', '.join(catalysts)}."
+        )
+    # Detect hedging / soft language
+    soft_language = []
+    for pat, label in [
+        (r"\bintent(?:ion|s)?\s+to\b|\bintends?\s+to\b", "'intent to' (not committed)"),
+        (r"\bexpl or", "'exploring' (no decision made)"),
+        (r"\bmay\b|\bcould\b|\bpotential(?:ly)?\b", "conditional language ('may'/'could'/'potential')"),
+        (r"\bletter\s+of\s+intent\b|\bmou\b|\bnon-?binding\b", "non-binding agreement"),
+        (r"\bup\s+to\b", "'up to' (a ceiling, not a commitment)"),
+        (r"\bpreliminary\b", "preliminary / unaudited figures"),
+    ]:
+        if re.search(pat, text, re.IGNORECASE):
+            soft_language.append(label)
+    if soft_language:
+        claim_parts.append(
+            "⚠️ Soft / hedged language detected: " + "; ".join(soft_language) +
+            ". The headline may imply more certainty than the actual announcement."
+        )
+    else:
+        claim_parts.append(
+            "Language appears direct (no obvious hedging like 'intent to' or 'exploring')."
+        )
+    out["claim_vs_implication"] = " ".join(claim_parts)
+
+    # ─── 2. Sentiment-score accuracy assessment ───
+    # Sanity-check the score against context clues.
+    issues = []
+    # Penny / microcap signal: buyout/tender price extracted that's very low
+    buyout_price = extract_buyout_price(text)
+    if buyout_price is not None and buyout_price < 1.00:
+        issues.append(f"sub-$1 price level (${buyout_price:.2f}) suggests a microcap — scores can be inflated by promotional language")
+    if "M&A / Buyout" in catalysts:
+        # Check if it's actually a buyback mis-tagged as M&A
+        if re.search(r"\b(?:buyback|repurchase|tender\s+offer\s+to\s+acquire\s+(?:up\s+to\s+)?\$?[\d.,]+.*own|its\s+own\s+(?:shares|stock))\b", text, re.IGNORECASE):
+            issues.append("looks like a SHARE BUYBACK, possibly mis-tagged as M&A — different (weaker) signal")
+    if warnings:
+        issues.append(f"{len(warnings)} price-context warning(s) flagged (see Warnings section)")
+    if score >= 50 and len(catalysts) <= 1 and not buyout_price:
+        issues.append("high score from a single catalyst — verify it's as strong as the score implies")
+
+    if issues:
+        verdict = "SCORE MAY BE OVERSTATED"
+        color = "#f59e0b"
+        detail = "Context suggests caution: " + "; ".join(issues) + "."
+    elif score >= 50 and len(catalysts) >= 2:
+        verdict = "SCORE LOOKS SUPPORTED"
+        color = "#10b981"
+        detail = "Multiple independent catalysts back up the score. Still verify the magnitude of each."
+    else:
+        verdict = "SCORE IS A STARTING POINT"
+        color = "#22d3ee"
+        detail = "No obvious red flags in the scoring, but the score only reflects headline language — not magnitude or what's priced in."
+    out["sentiment_assessment"] = (verdict, detail, color)
+
+    # ─── 3. Sector / macro context ───
+    out["sector"] = infer_sector(text)
+
+    # ─── 4. Questions to ask ───
+    questions = []
+    for cat in catalysts:
+        questions.extend(CATALYST_QUESTIONS.get(cat, []))
+    # De-dup while preserving order
+    seen_q = set()
+    questions = [q for q in questions if not (q in seen_q or seen_q.add(q))]
+    questions.extend(GENERIC_QUESTIONS)
+    out["questions"] = questions
+
+    # ─── 5. Red flags ───
+    red_flags = list(warnings)  # price-context warnings already computed
+    for pat, flag in [
+        (r"\breverse\s+(?:stock\s+)?split\b", "Reverse split history — verify share count / dilution"),
+        (r"\bgoing\s+concern\b", "'Going concern' language — serious solvency doubt"),
+        (r"\bdilut", "Dilution risk mentioned"),
+        (r"\boffering\b|\bregistered\s+direct\b|\bat[-\s]the[-\s]market\b|\batm\s+(?:offering|program)", "Capital raise / share offering — dilutive"),
+        (r"\bnasdaq\s+(?:notice|deficiency|compliance)\b|\bdelisting\b", "Listing-compliance issue"),
+        (r"\bsub-?penny\b|\$0\.\d{2}\b", "Sub-$1 / penny-stock price level"),
+        (r"\bnyse\s+american\b|\botc\b", "Trades on a secondary venue (NYSE American / OTC) — thinner liquidity"),
+        (r"\bshell\s+company\b|\breverse\s+merger\b", "Shell company / reverse merger structure"),
+    ]:
+        if re.search(pat, text, re.IGNORECASE):
+            if flag not in red_flags:
+                red_flags.append(flag)
+    out["red_flags"] = red_flags
+
+    # ─── 6. Missing info ───
+    missing = [
+        "Current price relative to fair value / analyst targets",
+        "Float, shares outstanding, and short interest",
+        "Cash position and burn rate",
+        "Whether the move is already priced in (pre-announcement run-up)",
+        "Dilution / capital-raise history",
+    ]
+    if "Earnings Beat" in catalysts or "Guidance Raise" in catalysts:
+        missing.append("The actual numbers vs. estimates (magnitude of the beat)")
+    if "Contract Win" in catalysts:
+        missing.append("Contract size relative to total revenue, and payout timeline")
+    if "FDA Approval" in catalysts:
+        missing.append("Addressable market, competition, and whether approval was expected")
+    out["missing_info"] = missing
+
+    # ─── 7. Bottom line (framework, not a call) ───
+    n_flags = len(red_flags)
+    if n_flags >= 3:
+        out["bottom_line"] = (
+            f"This story raises {n_flags} red flags. The framework suggests heavy "
+            "skepticism — verify every flag before considering any position. The score "
+            "alone does not justify action here."
+        )
+    elif n_flags >= 1:
+        out["bottom_line"] = (
+            f"A credible catalyst with {n_flags} caveat(s) to check. Work through the "
+            "questions and red flags above before deciding anything. The decision is yours — "
+            "this framework only organizes what to verify."
+        )
+    else:
+        out["bottom_line"] = (
+            "No obvious red flags, but 'no red flags' is not a buy signal. The headline can't "
+            "tell you what's priced in or whether the magnitude justifies the move. Work the "
+            "questions above against real data before acting."
+        )
+
+    return out
+
+
+
 # ───────────────────────────── RSS PARSING ────────────────────────────────────
 
 def fetch_feed(url):
@@ -2579,6 +2859,9 @@ class StoryDetailPanel(tk.Frame):
                          font=(FONT_DISPLAY, 9, "italic"), anchor="w"
                          ).pack(side="left", padx=(4, 8), pady=8)
 
+        # ─── Trader's Analysis framework ───
+        self._build_trader_analysis(body, s)
+
         self._section(body, "WHAT THIS SCORE MEANS")
         disc = (
             "The Bull Score is a keyword-based heuristic. A high score means the "
@@ -2626,6 +2909,88 @@ class StoryDetailPanel(tk.Frame):
         tk.Label(hdr, text=title, bg=PALETTE["bg"],
                  fg=PALETTE["text_dim"], font=(FONT_DISPLAY, 9, "bold")
                  ).pack(side="left")
+
+    def _build_trader_analysis(self, body, story):
+        """Render the structured senior-trader framework. Pure analysis of facts
+        the app already has — no buy/sell calls."""
+        analysis = generate_trader_analysis(story)
+
+        self._section(body, "TRADER'S ANALYSIS  ·  FRAMEWORK, NOT ADVICE")
+
+        # Intro disclaimer
+        tk.Label(body,
+            text="This organizes facts and the questions a disciplined trader asks. "
+                 "It does NOT tell you to buy or sell — those calls require data the "
+                 "headline doesn't contain, and are yours to make.",
+            bg=PALETTE["bg"], fg=PALETTE["text_mute"],
+            font=(FONT_DISPLAY, 8, "italic"), anchor="w", justify="left", wraplength=700
+            ).pack(fill="x", padx=24, pady=(0, 10))
+
+        def sub(label, color=None):
+            row = tk.Frame(body, bg=PALETTE["bg"])
+            row.pack(fill="x", padx=24, pady=(8, 2))
+            tk.Label(row, text=label, bg=PALETTE["bg"],
+                     fg=color or PALETTE["accent_hi"],
+                     font=(FONT_DISPLAY, 9, "bold"), anchor="w").pack(side="left")
+
+        def para(textval):
+            tk.Label(body, text=textval, bg=PALETTE["bg"], fg=PALETTE["text"],
+                     font=(FONT_DISPLAY, 9), anchor="w", justify="left", wraplength=690
+                     ).pack(fill="x", padx=24, pady=(0, 2))
+
+        def bullet_list(items, color=None):
+            for it in items:
+                row = tk.Frame(body, bg=PALETTE["bg"])
+                row.pack(fill="x", padx=24, pady=1)
+                tk.Label(row, text="•", bg=PALETTE["bg"],
+                         fg=color or PALETTE["text_mute"],
+                         font=(FONT_DISPLAY, 9, "bold")).pack(side="left", padx=(8, 6), anchor="n")
+                tk.Label(row, text=it, bg=PALETTE["bg"], fg=PALETTE["text"],
+                         font=(FONT_DISPLAY, 9), anchor="w", justify="left", wraplength=660
+                         ).pack(side="left", fill="x", expand=True)
+
+        # 1. Claim vs implication
+        sub("① Headline: claim vs. implication")
+        para(analysis["claim_vs_implication"])
+
+        # 2. Sentiment accuracy
+        verdict, detail, vcolor = analysis["sentiment_assessment"]
+        sub("② Is the sentiment score accurate?")
+        vrow = tk.Frame(body, bg=PALETTE["bg"])
+        vrow.pack(fill="x", padx=24, pady=(0, 2))
+        tk.Label(vrow, text=f" {verdict} ", bg=vcolor, fg="#0a0e1c",
+                 font=(FONT_DISPLAY, 9, "bold")).pack(side="left")
+        para(detail)
+
+        # 3. Sector context
+        sub("③ Sector / macro context")
+        para(f"Inferred sector: {analysis['sector']}. "
+             "Consider how the broader sector and macro backdrop (rates, sector rotation, "
+             "risk appetite) are trading today — a great catalyst into a falling sector can still drop.")
+
+        # 4. Questions
+        sub("④ Questions to ask before any decision")
+        bullet_list(analysis["questions"], color=PALETTE["accent"])
+
+        # 5. Red flags
+        sub("⑤ Red flags to watch", color=PALETTE["danger"] if analysis["red_flags"] else PALETTE["accent_hi"])
+        if analysis["red_flags"]:
+            bullet_list(analysis["red_flags"], color=PALETTE["danger"])
+        else:
+            para("No automated red flags detected — but absence of flags is not a green light.")
+
+        # 6. Missing info
+        sub("⑥ What the headline can't tell you")
+        bullet_list(analysis["missing_info"], color=PALETTE["text_mute"])
+
+        # 7. Bottom line
+        sub("⑦ Bottom line", color=PALETTE["warn"])
+        bl_frame = tk.Frame(body, bg=PALETTE["panel_alt"])
+        bl_frame.pack(fill="x", padx=24, pady=(2, 12))
+        tk.Label(bl_frame, text=analysis["bottom_line"],
+                 bg=PALETTE["panel_alt"], fg=PALETTE["text"],
+                 font=(FONT_DISPLAY, 9), anchor="w", justify="left", wraplength=660
+                 ).pack(fill="x", padx=12, pady=10)
 
     def _ticker_card(self, parent, ticker):
         """Full-width card per ticker: live price + TradingView CTA + research links."""
