@@ -61,7 +61,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.10.0"
+APP_VERSION = "3.11.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -2224,6 +2224,95 @@ def apply_price_context(base_score, breakdown, story, price_data):
     return score, breakdown, warnings
 
 
+# ─────────────────────────── CONFIDENCE METER ─────────────────────────────────
+# Confidence is SEPARATE from the bull score. The bull score answers "how strong
+# is the catalyst?". Confidence answers "how much should you trust this headline
+# at face value, before doing your own homework?". Low confidence does NOT mean
+# bearish — it means "verify before believing".
+
+def compute_confidence(story):
+    """
+    Returns (confidence_pct: int 0-100, level_label, color, reasons: list[str]).
+
+    Starts at 100 and deducts for signals that the headline can't be taken at
+    face value: hedged language, unverifiable claims, possible re-reports,
+    promotional-microcap markers, and (for M&A) deal-certainty / regulatory risk.
+
+    These are the 'Group B' questions from the trader framework — the ones the
+    app cannot definitively answer, so instead of faking an answer in the bull
+    score, they lower confidence and the reasons are shown explicitly.
+    """
+    title = story.get("title", "")
+    summary = story.get("summary", "")
+    text = f"{title}\n{summary}"
+    catalysts = story.get("catalysts", [])
+
+    confidence = 100
+    reasons = []
+
+    def deduct(amount, reason):
+        nonlocal confidence
+        confidence -= amount
+        reasons.append(reason)
+
+    # ─── Hedged / non-committal language (deal not binding, etc.) ───
+    if re.search(r"\bintent(?:ion|s)?\s+to\b|\bintends?\s+to\b", text, re.IGNORECASE):
+        deduct(20, "“Intent to” language — not a committed/binding action")
+    if re.search(r"\bexplor(?:e|es|ing)\b|\bevaluating\b|\bconsidering\b", text, re.IGNORECASE):
+        deduct(20, "“Exploring/evaluating” — no decision has been made")
+    if re.search(r"\bletter\s+of\s+intent\b|\bmou\b|\bnon-?binding\b|\bmemorandum\s+of\s+understanding\b", text, re.IGNORECASE):
+        deduct(18, "Non-binding agreement (LOI/MOU) — may never close")
+    if re.search(r"\bup\s+to\b", text, re.IGNORECASE):
+        deduct(8, "“Up to” — a ceiling, not a commitment")
+    if re.search(r"\bpreliminary\b|\bunaudited\b|\bpreliminary\s+results\b", text, re.IGNORECASE):
+        deduct(10, "Preliminary/unaudited figures — subject to revision")
+
+    # ─── M&A-specific deal-certainty / regulatory risk ───
+    if "M&A / Buyout" in catalysts:
+        # Binding language raises confidence back a bit; absence lowers it
+        if re.search(r"\bdefinitive\s+agreement\b|\bbinding\b|\bsigned\s+agreement\b|\bagreed\s+to\s+acquire\b", text, re.IGNORECASE):
+            pass  # binding — no deduction
+        else:
+            deduct(12, "M&A without explicit “definitive agreement” language — deal certainty unclear")
+        # Regulatory / antitrust sensitivity
+        if re.search(r"\bantitrust\b|\bregulatory\s+approval\b|\bftc\b|\bdoj\b|\bcfius\b|\bhsr\b|\bcompetition\s+(?:authority|review)\b", text, re.IGNORECASE):
+            deduct(10, "Regulatory/antitrust review mentioned — could delay or block the deal")
+        # Cross-border adds CFIUS-type risk
+        if re.search(r"\bchina\b|\bchinese\b|\bforeign\b|\bcross-?border\b", text, re.IGNORECASE):
+            deduct(6, "Cross-border element — added regulatory complexity")
+
+    # ─── Possible re-report / stale news ───
+    if re.search(r"\b(?:reiterat|reaffirm|previously\s+announced|as\s+announced|recap|update\s+on)\b", text, re.IGNORECASE):
+        deduct(12, "Looks like a re-report/reiteration — may already be priced in")
+
+    # ─── Promotional-microcap markers ───
+    if re.search(r"\$0\.\d{2}\b|\bsub-?penny\b", text):
+        deduct(15, "Sub-$1 price level — promotional microcap risk")
+    if re.search(r"\bnyse\s+american\b|\botc(?:mkts|qb|qx|pk)?\b|\bpink\s+sheet", text, re.IGNORECASE):
+        deduct(10, "Secondary venue (NYSE American / OTC) — thinner, more manipulable")
+
+    # ─── Source tier influences trust ───
+    tier_num, _, _ = source_tier(story.get("source", ""))
+    if tier_num == 3:
+        deduct(6, "Tier-3 source (aggregator/opinion) — verify against a primary source")
+
+    confidence = max(0, min(100, confidence))
+
+    if confidence >= 75:
+        level, color = "HIGH CONFIDENCE", "#10b981"
+    elif confidence >= 50:
+        level, color = "MODERATE CONFIDENCE", "#eab308"
+    elif confidence >= 30:
+        level, color = "LOW CONFIDENCE", "#f97316"
+    else:
+        level, color = "VERY LOW CONFIDENCE", "#ef4444"
+
+    if not reasons:
+        reasons.append("No trust-reducing signals detected — but always verify against the source.")
+
+    return confidence, level, color, reasons
+
+
 def conviction_label(score, has_bearish):
     """Plain-English label for a score. NOT a trade recommendation."""
     if has_bearish:
@@ -2398,7 +2487,7 @@ def generate_trader_analysis(story, price_data=None):
     soft_language = []
     for pat, label in [
         (r"\bintent(?:ion|s)?\s+to\b|\bintends?\s+to\b", "'intent to' (not committed)"),
-        (r"\bexpl or", "'exploring' (no decision made)"),
+        (r"\bexplor(?:e|es|ing)\b", "'exploring' (no decision made)"),
         (r"\bmay\b|\bcould\b|\bpotential(?:ly)?\b", "conditional language ('may'/'could'/'potential')"),
         (r"\bletter\s+of\s+intent\b|\bmou\b|\bnon-?binding\b", "non-binding agreement"),
         (r"\bup\s+to\b", "'up to' (a ceiling, not a commitment)"),
@@ -2925,6 +3014,48 @@ class StoryDetailPanel(tk.Frame):
             bg=PALETTE["bg"], fg=PALETTE["text_mute"],
             font=(FONT_DISPLAY, 8, "italic"), anchor="w", justify="left", wraplength=700
             ).pack(fill="x", padx=24, pady=(0, 10))
+
+        # ─── Confidence meter ───
+        conf = story.get("confidence")
+        if conf is not None:
+            conf_level = story.get("confidence_level", "")
+            conf_color = story.get("confidence_color", PALETTE["text_mute"])
+            conf_reasons = story.get("confidence_reasons", [])
+
+            cwrap = tk.Frame(body, bg=PALETTE["bg"])
+            cwrap.pack(fill="x", padx=24, pady=(0, 6))
+            tk.Label(cwrap, text="CONFIDENCE", bg=PALETTE["bg"],
+                     fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 8, "bold")
+                     ).pack(side="left", pady=(4, 0))
+            tk.Label(cwrap, text=f"  {conf}%  ", bg=conf_color, fg="#0a0e1c",
+                     font=(FONT_DISPLAY, 12, "bold")).pack(side="left", padx=(6, 6))
+            tk.Label(cwrap, text=conf_level, bg=PALETTE["bg"],
+                     fg=conf_color, font=(FONT_DISPLAY, 10, "bold")
+                     ).pack(side="left", pady=(2, 0))
+
+            # Meter bar
+            bar_bg = tk.Frame(body, bg=PALETTE["panel_alt"], height=8)
+            bar_bg.pack(fill="x", padx=24, pady=(2, 4))
+            bar_bg.pack_propagate(False)
+            fill = tk.Frame(bar_bg, bg=conf_color, height=8)
+            fill.place(relwidth=max(0.02, conf / 100.0), relheight=1.0)
+
+            tk.Label(body,
+                text="Confidence is separate from the Bull Score. It reflects how much to "
+                     "trust the headline at face value — LOW confidence means 'verify before "
+                     "believing', NOT 'bearish'.",
+                bg=PALETTE["bg"], fg=PALETTE["text_mute"],
+                font=(FONT_DISPLAY, 8, "italic"), anchor="w", justify="left", wraplength=700
+                ).pack(fill="x", padx=24, pady=(0, 4))
+
+            for r in conf_reasons:
+                rrow = tk.Frame(body, bg=PALETTE["bg"])
+                rrow.pack(fill="x", padx=24, pady=1)
+                tk.Label(rrow, text="–", bg=PALETTE["bg"], fg=conf_color,
+                         font=(FONT_DISPLAY, 9, "bold")).pack(side="left", padx=(8, 6), anchor="n")
+                tk.Label(rrow, text=r, bg=PALETTE["bg"], fg=PALETTE["text_dim"],
+                         font=(FONT_DISPLAY, 9), anchor="w", justify="left", wraplength=660
+                         ).pack(side="left", fill="x", expand=True)
 
         def sub(label, color=None):
             row = tk.Frame(body, bg=PALETTE["bg"])
@@ -3596,6 +3727,18 @@ class StoryCard(tk.Frame):
         tk.Label(score_wrap, text="BULL  ", bg=PALETTE["panel"],
                  fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 8)
                  ).pack(side="right", pady=(2, 0))
+
+        # Confidence pill (separate from bull score) — shows how much to trust
+        # the headline at face value. Low confidence ≠ bearish.
+        conf = s.get("confidence")
+        if conf is not None:
+            conf_color = s.get("confidence_color", PALETTE["text_mute"])
+            tk.Label(score_wrap, text=f"  {conf}%  ", bg=conf_color, fg="#0a0e1c",
+                     font=(FONT_DISPLAY, 10, "bold")
+                     ).pack(side="right", padx=(0, 10))
+            tk.Label(score_wrap, text="CONF  ", bg=PALETTE["panel"],
+                     fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 8)
+                     ).pack(side="right", pady=(2, 0))
 
         # Title
         tk.Label(content, text=s["title"], bg=PALETTE["panel"],
@@ -4451,6 +4594,13 @@ class PreMarketScanner(tk.Tk):
                         s["breakdown"] = new_breakdown
                         s["warnings"] = warnings
 
+                # ─── Confidence meter (separate from bull score) ───
+                conf_pct, conf_level, conf_color, conf_reasons = compute_confidence(s)
+                s["confidence"] = conf_pct
+                s["confidence_level"] = conf_level
+                s["confidence_color"] = conf_color
+                s["confidence_reasons"] = conf_reasons
+
                 # Persist if: high-scoring OR user has pinned this story.
                 # Pinned stories should never be lost even if score is 0.
                 should_persist = (s["score"] >= PERSIST_MIN_SCORE) or s["pinned"]
@@ -4554,6 +4704,12 @@ class PreMarketScanner(tk.Tk):
                 p["breakdown"] = []
                 p["watch_match"] = bool(self.watchlist & set(p.get("tickers", [])))
                 p["pinned"] = is_pinned
+                if "confidence" not in p:
+                    cpct, clevel, ccolor, creasons = compute_confidence(p)
+                    p["confidence"] = cpct
+                    p["confidence_level"] = clevel
+                    p["confidence_color"] = ccolor
+                    p["confidence_reasons"] = creasons
                 stories.append(p)
 
             self.fetch_queue.put(("done", stories))
