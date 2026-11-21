@@ -7,6 +7,10 @@ Benzinga, Globe Newswire, SEC EDGAR press releases, Yahoo Finance), scores them
 0-100 for bullish conviction, tags catalysts, extracts tickers, and auto-refreshes
 every 5 minutes during pre-market hours (4:00 AM - 9:30 AM ET).
 
+v3.12: SHORT SCAN mode. Every story is scored both ways (bull + short) in one
+pass. Toggle BULL / SHORT in the sidebar to see bearish catalysts (earnings
+misses, guidance cuts, offerings/dilution, FDA failures, downgrades, etc.).
+
 Dependencies: tkinter (stdlib), tzdata (pip install tzdata) on Windows.
 Run:          python premarket_scanner.py
 """
@@ -61,7 +65,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.11.0"
+APP_VERSION = "3.12.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -310,6 +314,213 @@ CATEGORY_COLORS = {
 }
 
 ALL_CATEGORIES = list(CATALYST_KEYWORDS.keys())
+
+# ═════════════════════════════ SHORT SCAN DATA ════════════════════════════════
+# Mirror image of CATALYST_KEYWORDS: bearish catalysts that tend to push a stock
+# DOWN. Same shape (weight + patterns) so the same scoring loop works for both.
+
+SHORT_CATALYST_KEYWORDS = {
+    "Earnings Miss": {
+        "weight": 22,
+        "patterns": [
+            r"\bmiss(?:es|ed)?\s+(?:on\s+)?(?:earnings|estimates|expectations|eps|revenue|consensus|q[1-4])",
+            r"\bfalls?\s+short\s+of\s+(?:estimates|expectations|forecasts?|consensus)",
+            r"\bfell\s+short\s+of\s+(?:estimates|expectations|forecasts?|consensus)",
+            r"\bbelow\s+(?:analyst\s+)?(?:estimates|expectations|consensus)",
+            r"\bworse[-\s]than[-\s]expected",
+            r"\bwider[-\s]than[-\s]expected\s+loss",
+            r"\bdisappointing\s+(?:results|quarter|earnings|sales|revenue)",
+            r"\brevenue\s+(?:decline[sd]?|drop(?:s|ped)?|fell|falls)",
+        ],
+    },
+    "Guidance Cut": {
+        "weight": 22,
+        "patterns": [
+            r"\b(?:cuts?|lowers?|lowered|slash(?:es|ed)?|reduces?|reduced|trims?|trimmed)\s+(?:its\s+)?(?:full[-\s]year\s+|fy\s*\d*\s+|annual\s+|q[1-4]\s+)?(?:guidance|outlook|forecast)",
+            r"\bguidance\s+(?:cut|lowered|reduced|slashed)",
+            r"\b(?:withdraws?|suspends?|pulls?)\s+(?:its\s+)?(?:full[-\s]year\s+)?(?:guidance|outlook|forecast)",
+            r"\b(?:weak|soft|disappointing|downbeat|bleak)\s+(?:guidance|outlook|forecast)",
+            r"\bprofit\s+warning",
+            r"\bwarns?\s+(?:of|on)\s+(?:lower|weaker|slower)",
+        ],
+    },
+    "FDA / Trial Failure": {
+        "weight": 28,
+        "patterns": [
+            r"\bfda\s+(?:rejects?|rejected|rejection|declines?\s+to\s+approve)",
+            r"\bcomplete\s+response\s+letter",
+            r"\bcrl\b",
+            r"\b(?:fails?|failed|misses|missed)\s+(?:to\s+meet\s+)?(?:its\s+|the\s+)?primary\s+endpoint",
+            r"\btrial\s+(?:fails?|failed|failure|halted|stopped)",
+            r"\bclinical\s+hold",
+            r"\bdiscontinu(?:es|ed|ing)\s+(?:the\s+)?(?:trial|study|program|development)",
+            r"\brefus(?:e|al)\s+to\s+file",
+            r"\bdid\s+not\s+(?:meet|achieve)\s+(?:statistical\s+significance|(?:the\s+)?primary)",
+        ],
+    },
+    "Offering / Dilution": {
+        "weight": 24,
+        "patterns": [
+            r"\b(?:proposed\s+)?(?:public|underwritten|secondary|follow-on)\s+offering",
+            r"\bregistered\s+direct\s+offering",
+            r"\bprices?\s+(?:\$?[\d.,]+\s*(?:million|billion|m|b)?\s+)?(?:public\s+|registered\s+direct\s+|underwritten\s+)?offering",
+            r"\bpricing\s+of\s+(?:\$?[\d.,]+\s*(?:million|billion|m|b)?\s+)?(?:public\s+|registered\s+direct\s+)?offering",
+            r"\bat[-\s]the[-\s]market\s+(?:offering|program|equity)",
+            r"\batm\s+(?:offering|program|facility)",
+            r"\bprivate\s+placement",
+            r"\bshelf\s+registration",
+            r"\bconvertible\s+(?:notes?|debentures?|preferred)\s+offering",
+            r"\bwarrants?\s+(?:exercise|inducement)",
+            r"\bdilut(?:ion|ive)",
+        ],
+    },
+    "Analyst Downgrade": {
+        "weight": 16,
+        "patterns": [
+            r"\bdowngrade[ds]?\s+to\s+(?:sell|underweight|underperform|neutral|hold|market\s+perform|equal[-\s]weight|reduce)",
+            r"\bdowngraded?\s+(?:by|at)\s+\w+",
+            r"\bprice\s+target\s+(?:cut|lowered|reduced|slashed|trimmed)",
+            r"\b(?:cuts?|lowers?|slash(?:es)?|trims?)\s+(?:its\s+)?price\s+target",
+            r"\binitiated?\s+(?:at|with)\s+(?:sell|underweight|underperform)",
+            r"\breiterated?\s+(?:sell|underweight|underperform)",
+        ],
+    },
+    "Legal / SEC": {
+        "weight": 18,
+        "patterns": [
+            r"\bsec\s+(?:probe|investigation|charges|subpoena|inquiry|enforcement)",
+            r"\b(?:doj|justice\s+department|ftc)\s+(?:probe|investigation|sues|lawsuit|charges)",
+            r"\bfraud\b",
+            r"\baccounting\s+(?:irregularities|issues|errors|probe)",
+            r"\brestat(?:e|es|ed|ement)\s+(?:of\s+)?(?:financial|earnings|results)",
+            r"\bindict(?:ed|ment)",
+            r"\bshort[-\s]seller\s+(?:report|alleges|target)",
+            r"\bshort\s+report\b",
+        ],
+    },
+    "Bankruptcy / Delisting": {
+        "weight": 30,
+        "patterns": [
+            r"\bbankruptcy",
+            r"\bchapter\s+(?:11|7)\b",
+            r"\bgoing\s+concern",
+            r"\bdelist(?:ed|ing)?\b",
+            r"\b(?:nasdaq|nyse)\s+(?:deficiency|non-?compliance|notice\s+of\s+(?:non-?compliance|delisting))",
+            r"\b(?:defaults?|default(?:ed)?)\s+on\s+(?:its\s+)?(?:debt|loan|notes|bonds|payment)",
+            r"\bmisse[sd]\s+(?:an?\s+)?(?:interest|debt|bond)\s+payment",
+            r"\brestructuring\s+support\s+agreement",
+            r"\bwind(?:s|ing)?\s+down\s+(?:operations|the\s+company)",
+        ],
+    },
+    "Contract Loss": {
+        "weight": 16,
+        "patterns": [
+            r"\b(?:loses?|lost)\s+(?:a\s+|its\s+|the\s+)?(?:major\s+|key\s+|largest\s+)?(?:contract|customer|client|deal)",
+            r"\bcontract\s+(?:terminated|cancell?ed|canceled|not\s+renewed|lost)",
+            r"\b(?:terminates?|cancels?|ends?)\s+(?:its\s+)?(?:supply\s+|license\s+|distribution\s+|partnership\s+|collaboration\s+)?(?:agreement|partnership|collaboration|contract)",
+            r"\bpartnership\s+(?:ends|ended|terminated|dissolved)",
+        ],
+    },
+    "Deal Collapse": {
+        "weight": 20,
+        "patterns": [
+            r"\b(?:merger|acquisition|deal|takeover)\s+(?:terminated|called\s+off|collapses?|collapsed|falls?\s+through|fell\s+through|blocked|abandoned|scrapped)",
+            r"\bterminat(?:es|ed|ion\s+of)\s+(?:the\s+|its\s+)?(?:merger|acquisition)\s+agreement",
+            r"\bwalks?\s+away\s+from\s+(?:the\s+)?(?:deal|merger|acquisition)",
+            r"\b(?:ftc|doj|regulators?)\s+(?:sues?\s+to\s+)?block",
+        ],
+    },
+    "Insider Selling / Exec Exit": {
+        "weight": 12,
+        "patterns": [
+            r"\binsider\s+(?:selling|sale|sells)",
+            r"\b(?:ceo|cfo|chairman|founder|director|president)\s+(?:sells?|sold|dumps?|unloads?)\s+(?:\$?[\d.,]+\s*(?:million|m)?\s+(?:in\s+|of\s+)?)?(?:shares|stock)",
+            r"\b(?:ceo|cfo|coo|chief\s+executive|chief\s+financial\s+officer|president|chairman)\s+(?:resigns?|resigned|steps?\s+down|stepped\s+down|departs?|ousted|fired|terminated|exits?|to\s+leave)",
+            r"\bauditor\s+(?:resigns?|resigned|quits?|dismissed)",
+            r"\bsudden\s+(?:departure|resignation)",
+        ],
+    },
+    "Recall / Safety": {
+        "weight": 12,
+        "patterns": [
+            r"\brecall(?:s|ed|ing)?\b",
+            r"\bfda\s+warning\s+letter",
+            r"\bsafety\s+(?:concerns?|issues?|probe|investigation|signal)",
+            r"\bdata\s+breach",
+            r"\b(?:cyber\s*attack|ransomware\s+attack)",
+            r"\bpatient\s+deaths?",
+        ],
+    },
+}
+
+# Bullish language that WEAKENS a short thesis — the mirror of BEARISH_PATTERNS.
+SHORT_COUNTER_PATTERNS = [
+    (r"\bbeats?\s+(?:on\s+)?(?:earnings|estimates|expectations)", -25, "Earnings beat"),
+    (r"\b(?:raises?|boosts?|lifts?)\s+(?:full[-\s]year\s+)?(?:guidance|outlook|forecast)", -22, "Guidance raise"),
+    (r"\bupgrade[ds]?\s+to\s+(?:buy|overweight|outperform|strong\s+buy)", -20, "Analyst upgrade"),
+    (r"\bfda\s+(?:approval|approves?|approved|clears?)", -28, "FDA approval"),
+    # Shorting a takeover target is dangerous: the price gets pinned to the offer.
+    (r"\b(?:to\s+be\s+acquired|agrees?\s+to\s+be\s+acquired|buyout\s+offer|takeover\s+(?:bid|offer)|tender\s+offer|going\s+private)", -30, "Takeover / buyout language"),
+    (r"\bshare\s+(?:buyback|repurchase)|\bbuyback\s+program", -10, "Buyback"),
+    (r"\bshort\s+squeeze|\bheavily\s+shorted|\bhigh\s+short\s+interest", -15, "Squeeze risk"),
+    (r"\b(?:soars?|soared|surges?|surged|skyrockets?|rockets?|rallies|rallied|jumps?|jumped)\b", -8, "Rally language"),
+    (r"\brecord\s+(?:quarter|revenue|sales|earnings)", -12, "Record results"),
+    (r"\binsider\s+(?:buying|purchase)|\b(?:ceo|director)\s+buys?\s+shares", -10, "Insider buying"),
+    (r"\b(?:wins?|awarded|secures?)\s+(?:\$?[\d.,]+\s*(?:million|billion|m|b)?\s+)?contract", -10, "Contract win"),
+]
+
+# Law-firm "investor alert" press releases pile onto every stock that drops.
+# They sound bearish but are almost never NEW news — heavy penalty in short mode.
+_RE_LAWFIRM_SPAM = re.compile(
+    r"\b(?:investor\s+alert|shareholder\s+alert|shareholder\s+rights\s+law\s+firm|"
+    r"on\s+behalf\s+of\s+(?:investors|shareholders)|class\s+action\s+(?:lawsuit\s+)?(?:filed|deadline|reminder)|"
+    r"lead\s+plaintiff\s+deadline|investigat(?:es|ing|ion)\s+(?:claims|potential\s+securities)|"
+    r"rosen\s+law|pomerantz|levi\s*&\s*korsinsky|bragar\s+eagel|glancy\s+prongay|faruqi|"
+    r"bronstein,?\s+gewirtz|kessler\s+topaz|robbins\s+geller|schall\s+law|portnoy\s+law|"
+    r"gross\s+law\s+firm|halper\s+sadeh|kahn\s+swick|block\s*&\s*leviton|bernstein\s+liebhard|"
+    r"johnson\s+fistel|holzer\s*&\s*holzer|frank\s+r\.?\s+cruz|howard\s+g\.?\s+smith)\b",
+    re.IGNORECASE,
+)
+
+SHORT_MAGNITUDE_BONUS = [
+    (r"\$\d{1,3}(?:[\.,]\d{3})*\s*billion\b", 6, "$ billion mention"),
+    (r"\$\d{2,4}(?:[\.,]\d{3})*\s*million\b", 3, "Million magnitude"),
+    (r"\b(?:52[-\s]week|all[-\s]time|record)\s+low", 5, "New low"),
+    (r"\b(?:plunges?|plunged|plummets?|plummeted|tumbles?|tumbled|sinks?|sank|craters?|cratered|tanks?|tanked)\b", 4, "Market already reacting"),
+    (r"\b(?:impairment|write[-\s]?(?:down|off))", 5, "Impairment / write-down"),
+    (r"\b(?:layoffs?|job\s+cuts|workforce\s+reduction)", 4, "Layoffs"),
+]
+
+SHORT_CATEGORY_COLORS = {
+    "Earnings Miss":               "#ef4444",
+    "Guidance Cut":                "#f43f5e",
+    "FDA / Trial Failure":         "#a855f7",
+    "Offering / Dilution":         "#f97316",
+    "Analyst Downgrade":           "#e879f9",
+    "Legal / SEC":                 "#fb7185",
+    "Bankruptcy / Delisting":      "#dc2626",
+    "Contract Loss":               "#f59e0b",
+    "Deal Collapse":               "#eab308",
+    "Insider Selling / Exec Exit": "#c084fc",
+    "Recall / Safety":             "#fca5a5",
+}
+
+ALL_SHORT_CATEGORIES = list(SHORT_CATALYST_KEYWORDS.keys())
+
+# One lookup for both modes (names don't collide).
+CATEGORY_COLORS.update(SHORT_CATEGORY_COLORS)
+
+# Per-mode UI theme bits.
+MODE_THEME = {
+    "bull":  {"word": "BULL",  "title": "◆  BULL SCANNER",  "accent": "#22d3ee",
+              "accent_hi": "#67e8f9", "pos": "#10b981", "neg": "#ef4444",
+              "window": "Pre-Market Bullish News Scanner",
+              "sub": "Pre-market catalyst detection  ·  4:00–9:30 AM ET"},
+    "short": {"word": "SHORT", "title": "▼  SHORT SCANNER", "accent": "#f87171",
+              "accent_hi": "#fca5a5", "pos": "#ef4444", "neg": "#10b981",
+              "window": "Pre-Market Short Scanner",
+              "sub": "Bearish catalyst detection  ·  4:00–9:30 AM ET"},
+}
 
 # ───────────────────────────── UTILITIES ──────────────────────────────────────
 
@@ -1174,6 +1385,17 @@ def fetch_remote_script():
     with urlopen(req, timeout=HTTP_TIMEOUT) as resp:
         return resp.read()
 
+def _version_tuple(v):
+    try:
+        return tuple(int(x) for x in str(v).strip().split("."))
+    except Exception:
+        return (0,)
+
+def _parse_app_version(script_bytes):
+    """Pull APP_VERSION = "x.y.z" out of a script's source. None if not found."""
+    m = re.search(rb'^APP_VERSION\s*=\s*["\']([\d.]+)["\']', script_bytes[:20000], re.MULTILINE)
+    return _version_tuple(m.group(1).decode()) if m else None
+
 def check_for_update():
     """
     Check GitHub for a newer version of the script.
@@ -1200,6 +1422,14 @@ def check_for_update():
         if _sha256(local_bytes) == _sha256(remote_bytes):
             return {"available": False, "remote_bytes": None,
                     "reason": "Already up to date."}
+
+        # Never offer to replace a NEWER local build with an older GitHub copy
+        # (e.g. you edited locally and haven't pushed to GitHub yet).
+        remote_ver = _parse_app_version(remote_bytes)
+        if remote_ver is not None and _version_tuple(APP_VERSION) > remote_ver:
+            return {"available": False, "remote_bytes": None,
+                    "reason": (f"Your local v{APP_VERSION} is newer than GitHub "
+                               f"(v{'.'.join(map(str, remote_ver))}). Push your changes to GitHub.")}
 
         return {"available": True, "remote_bytes": remote_bytes, "reason": "Update available."}
 
@@ -2327,6 +2557,277 @@ def conviction_label(score, has_bearish):
         return "WEAK SIGNAL", "#f97316", "Minor bullish hints, but the signal is weak."
     return "NO SIGNAL", "#6b7280", "No meaningful bullish catalyst found in this headline."
 
+
+# ═══════════════════════════ SHORT SCAN SCORING ═══════════════════════════════
+# Same structure as score_story / apply_price_context / compute_confidence, but
+# for bearish catalysts. A high SHORT score means "bearish catalyst language".
+# Like the bull score, it is NOT a trade recommendation.
+
+def is_lawfirm_spam(title, summary=""):
+    return bool(_RE_LAWFIRM_SPAM.search(f"{title}\n{summary or ''}"))
+
+
+def score_short_story(title, summary):
+    """Returns (score 0-100, list of short catalyst tags, breakdown list)."""
+    text = f"{title}\n{summary}".lower()
+    score = 0
+    tags = []
+    breakdown = []
+
+    for category, cfg in SHORT_CATALYST_KEYWORDS.items():
+        for pat in cfg["patterns"]:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                score += cfg["weight"]
+                tags.append(category)
+                breakdown.append((category, cfg["weight"], m.group(0)))
+                break
+
+    for pat, bonus, label in SHORT_MAGNITUDE_BONUS:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            score += bonus
+            breakdown.append((label, bonus, m.group(0)))
+
+    for pat, penalty, label in SHORT_COUNTER_PATTERNS:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            score += penalty
+            breakdown.append((label, penalty, m.group(0)))
+
+    # Law-firm "investor alert" spam — sounds bearish, almost never new news.
+    if is_lawfirm_spam(title, summary):
+        score -= 25
+        breakdown.append(("Law-firm alert (not new news)", -25, "investor alert / class action ad"))
+
+    title_lower = title.lower()
+    title_bonus = 0
+    for cfg in SHORT_CATALYST_KEYWORDS.values():
+        for pat in cfg["patterns"]:
+            if re.search(pat, title_lower, re.IGNORECASE):
+                title_bonus += 4
+                break
+    title_bonus = min(title_bonus, 12)
+    if title_bonus:
+        score += title_bonus
+        breakdown.append(("Headline emphasis", title_bonus, "(bearish catalyst words in title)"))
+
+    final = max(0, min(100, score))
+    return final, tags, breakdown
+
+
+def apply_short_price_context(base_score, breakdown, story, price_data):
+    """Short-side mirror of apply_price_context(). Returns (score, breakdown, warnings)."""
+    score = base_score
+    warnings = []
+    text = f"{story.get('title','')}\n{story.get('summary','')}"
+
+    # Reverse splits are usually followed by more dilution — a plus for shorts.
+    if has_reverse_split_language(text):
+        bonus = 6
+        score += bonus
+        breakdown.append(("Reverse split (dilution often follows)", bonus, "reverse split"))
+
+    if not price_data:
+        return max(0, min(100, score)), breakdown, warnings
+
+    current_price = price_data.get("price")
+    if not current_price or current_price <= 0:
+        return max(0, min(100, score)), breakdown, warnings
+
+    # Buyout price in the story = price likely pinned near the offer.
+    buyout_price = extract_buyout_price(text)
+    if buyout_price and buyout_price > 0:
+        warnings.append(
+            f"Buyout/tender price ${buyout_price:.2f} mentioned — shorting an acquisition "
+            "target is very risky (price tends to stick to the offer)"
+        )
+
+    if current_price < 1.0:
+        warnings.append(
+            f"Sub-$1 stock (${current_price:.2f}) — often hard or impossible to borrow, "
+            "and brokers may not allow shorting it"
+        )
+
+    change_pct = price_data.get("change_pct")
+    if change_pct is not None:
+        if change_pct <= -30:
+            warnings.append(
+                f"Already down {change_pct:.1f}% today — much of the move may be done; "
+                "oversold bounces can be violent"
+            )
+        elif change_pct >= 10:
+            warnings.append(
+                f"Stock is UP {change_pct:+.1f}% despite bearish news — the market may "
+                "disagree with the headline (squeeze risk)"
+            )
+
+    # Volume confirmation — same tiers as the bull side.
+    vol = price_data.get("volume")
+    avg_vol = price_data.get("avg_volume_30d")
+    if vol and avg_vol and avg_vol > 0:
+        multiple = vol / avg_vol
+        if multiple >= 5.0:
+            bonus = 10
+            score += bonus
+            breakdown.append(("Extreme volume", bonus, f"{multiple:.1f}x 30d average"))
+        elif multiple >= 3.0:
+            bonus = 7
+            score += bonus
+            breakdown.append(("High volume", bonus, f"{multiple:.1f}x 30d average"))
+        elif multiple >= 2.0:
+            bonus = 4
+            score += bonus
+            breakdown.append(("Elevated volume", bonus, f"{multiple:.1f}x 30d average"))
+
+    score = max(0, min(100, score))
+    return score, breakdown, warnings
+
+
+def compute_short_confidence(story):
+    """Short-side mirror of compute_confidence(): how much to trust a BEARISH
+    headline at face value. Returns (pct, level, color, reasons)."""
+    title = story.get("title", "")
+    summary = story.get("summary", "")
+    text = f"{title}\n{summary}"
+    catalysts = story.get("catalysts", [])
+
+    confidence = 100
+    reasons = []
+
+    def deduct(amount, reason):
+        nonlocal confidence
+        confidence -= amount
+        reasons.append(reason)
+
+    if is_lawfirm_spam(title, summary):
+        deduct(35, "Law-firm 'investor alert' — these get posted on almost every stock drop; usually not new news")
+
+    if re.search(r"\bexplor(?:e|es|ing)\b|\bevaluating\b|\bconsidering\b", text, re.IGNORECASE):
+        deduct(15, "“Exploring/considering” — nothing has actually happened yet")
+    if re.search(r"\bpreliminary\b|\bunaudited\b", text, re.IGNORECASE):
+        deduct(10, "Preliminary/unaudited figures — subject to revision")
+
+    if "Offering / Dilution" in catalysts:
+        priced = re.search(r"\bprices?\b|\bpricing\s+of\b|\bpriced\b|\bclos(?:es|ed|ing)\s+(?:of\s+)?(?:its\s+)?(?:\$?[\d.,]+\s*(?:million|m)?\s+)?(?:public\s+|registered\s+direct\s+)?offering", text, re.IGNORECASE)
+        if re.search(r"\bshelf\s+registration\b|\bs-3\b|\bfiles?\s+(?:for|to)\b", text, re.IGNORECASE) and not priced:
+            deduct(15, "Shelf/filing only — they CAN sell shares, but none have been sold yet")
+        elif re.search(r"\bproposed\b", text, re.IGNORECASE) and not priced:
+            deduct(8, "“Proposed” offering — size and price not set yet")
+        if re.search(r"\bat[-\s]the[-\s]market\b|\batm\b", text, re.IGNORECASE):
+            deduct(6, "ATM program — shares are sold gradually over time, not all at once")
+
+    if "Analyst Downgrade" in catalysts and re.search(r"\bto\s+(?:neutral|hold|market\s+perform|equal[-\s]weight)\b", text, re.IGNORECASE):
+        deduct(8, "Downgrade only to Neutral/Hold — weaker than a Sell rating")
+
+    # Squeeze / takeover risk — the two classic short killers
+    if re.search(r"\bshort\s+squeeze\b|\bheavily\s+shorted\b|\bshort\s+interest\b|\bmeme\b", text, re.IGNORECASE):
+        deduct(15, "Squeeze talk / high short interest mentioned — crowded shorts can rip higher")
+    if re.search(r"\bto\s+be\s+acquired\b|\bbuyout\b|\btakeover\b|\btender\s+offer\b|\bgoing\s+private\b", text, re.IGNORECASE):
+        deduct(20, "Takeover / buyout language — price may be pinned to an offer")
+
+    # Already priced in?
+    if re.search(r"\b(?:plunges?|plunged|plummets?|plummeted|tumbles?|tumbled|sinks?|sank|craters?|cratered|tanks?|tanked)\b", title, re.IGNORECASE):
+        deduct(10, "Headline says it already dropped — the easy part of the move may be over")
+
+    if re.search(r"\b(?:reiterat|reaffirm|previously\s+announced|as\s+announced|recap|update\s+on)\b", text, re.IGNORECASE):
+        deduct(12, "Looks like a re-report/reiteration — may already be priced in")
+
+    if re.search(r"\$0\.\d{2}\b|\bsub-?penny\b", text):
+        deduct(12, "Sub-$1 price level — may be hard to borrow / not shortable")
+    if re.search(r"\bnyse\s+american\b|\botc(?:mkts|qb|qx|pk)?\b|\bpink\s+sheet", text, re.IGNORECASE):
+        deduct(10, "Secondary venue (NYSE American / OTC) — thin, volatile, hard to borrow")
+
+    tier_num, _, _ = source_tier(story.get("source", ""))
+    if tier_num == 3:
+        deduct(6, "Tier-3 source (aggregator/opinion) — verify against a primary source")
+
+    confidence = max(0, min(100, confidence))
+    if confidence >= 75:
+        level, color = "HIGH CONFIDENCE", "#10b981"
+    elif confidence >= 50:
+        level, color = "MODERATE CONFIDENCE", "#eab308"
+    elif confidence >= 30:
+        level, color = "LOW CONFIDENCE", "#f97316"
+    else:
+        level, color = "VERY LOW CONFIDENCE", "#ef4444"
+
+    if not reasons:
+        reasons.append("No trust-reducing signals detected — but always verify against the source.")
+    return confidence, level, color, reasons
+
+
+def short_conviction_label(score, has_counter):
+    """Plain-English label for a SHORT score. NOT a trade recommendation."""
+    if has_counter:
+        return "MIXED SIGNAL", "#f59e0b", "This story contains both bearish and bullish language. Read carefully."
+    if score >= 75:
+        return "STRONG SHORT SIGNAL", "#dc2626", "Multiple strong bearish catalysts detected in this headline."
+    if score >= 50:
+        return "BEARISH", "#ef4444", "Clear bearish catalyst in this story."
+    if score >= 25:
+        return "MILDLY BEARISH", "#f97316", "Some bearish language detected — verify with the source."
+    if score >= 10:
+        return "WEAK SIGNAL", "#eab308", "Minor bearish hints, but the signal is weak."
+    return "NO SIGNAL", "#6b7280", "No meaningful bearish catalyst found in this headline."
+
+
+def label_for_mode(mode, score, has_counter):
+    if mode == "short":
+        return short_conviction_label(score, has_counter)
+    return conviction_label(score, has_counter)
+
+
+def color_for_mode_score(mode, score):
+    if mode == "short":
+        if score >= 70: return "#dc2626"
+        if score >= 45: return "#ef4444"
+        if score >= 25: return "#f97316"
+        if score >= 10: return "#eab308"
+        return "#6b7280"
+    return color_for_score(score)
+
+
+def score_story_both_ways(story):
+    """Text-score a story in BOTH modes. Returns dict mode -> result dict."""
+    title = story.get("title", "")
+    summary = story.get("summary", "")
+    b_score, b_cats, b_bd = score_story(title, summary)
+    s_score, s_cats, s_bd = score_short_story(title, summary)
+    return {
+        "bull":  {"score": b_score, "catalysts": b_cats, "breakdown": b_bd, "warnings": []},
+        "short": {"score": s_score, "catalysts": s_cats, "breakdown": s_bd, "warnings": []},
+    }
+
+
+def attach_confidence(story, mode_result, mode):
+    """Compute the mode-specific confidence for a story and store it on mode_result."""
+    probe = dict(story)
+    probe["catalysts"] = mode_result["catalysts"]
+    fn = compute_short_confidence if mode == "short" else compute_confidence
+    pct, level, color, reasons = fn(probe)
+    mode_result["confidence"] = pct
+    mode_result["confidence_level"] = level
+    mode_result["confidence_color"] = color
+    mode_result["confidence_reasons"] = reasons
+
+
+_MODE_FIELDS = ("score", "catalysts", "breakdown", "warnings", "confidence",
+                "confidence_level", "confidence_color", "confidence_reasons")
+
+
+def project_story_mode(story, mode):
+    """Copy the chosen mode's results onto the story's top-level fields so all
+    existing UI code (which reads story['score'] etc.) shows that mode."""
+    res = story.get(mode)
+    if not res:
+        story["mode"] = mode
+        return
+    for k in _MODE_FIELDS:
+        if k in res:
+            story[k] = res[k]
+    story["mode"] = mode
+
 # ─────────────────────── TRADER'S ANALYSIS FRAMEWORK ──────────────────────────
 # Generates a structured, senior-trader-style framework for a story. This does
 # NOT make buy/sell calls or invent "actionable" conclusions. It organizes facts
@@ -2452,6 +2953,192 @@ GENERIC_QUESTIONS = [
 ]
 
 
+# ─── Short-side trader framework ──────────────────────────────────────────────
+SHORT_CATALYST_QUESTIONS = {
+    "Earnings Miss": [
+        "How big was the miss? A penny miss is noise; a big revenue miss matters more than EPS.",
+        "Did they also cut guidance? A miss WITH a guide-down is much stronger than a one-off miss.",
+        "Had the stock already sold off into earnings? (The miss may be priced in.)",
+    ],
+    "Guidance Cut": [
+        "How big is the cut vs. what analysts expected? (A 'cut' that matches lowered expectations can rally.)",
+        "Is the cut company-specific or industry-wide / macro?",
+        "Is this the first cut, or part of a pattern of cuts?",
+    ],
+    "FDA / Trial Failure": [
+        "Is this the company's lead drug or a minor pipeline asset? Single-asset biotechs can drop 60-90%.",
+        "Is it a full rejection, or a CRL that can be fixed with more data?",
+        "How much cash do they have? A failure often forces an offering next — more downside.",
+    ],
+    "Offering / Dilution": [
+        "What's the offering price vs. the current price? Stocks often drift toward the offering price.",
+        "How big is the raise vs. market cap? 5% is minor; 30%+ is heavy dilution.",
+        "Is it PRICED (shares sold) or just filed/proposed? Shelf filings are only a possibility.",
+        "Are warrants attached? Warrants add future dilution and selling pressure.",
+    ],
+    "Analyst Downgrade": [
+        "Downgrade to SELL, or only to Hold/Neutral? Big difference.",
+        "Which firm, and how much does the new price target imply vs. the current price?",
+        "Is this one analyst, or are several cutting at once?",
+    ],
+    "Legal / SEC": [
+        "Is this a real SEC/DOJ action, or a law-firm press release fishing for clients?",
+        "Is there a specific allegation (fraud, accounting) or just a vague 'investigation'?",
+        "Short-seller reports: who wrote it, and what's their track record?",
+    ],
+    "Bankruptcy / Delisting": [
+        "Is this an actual Chapter 11 filing, or a 'going concern' warning / exchange notice?",
+        "Delisting notices often give 180 days to fix — is a reverse split coming?",
+        "Bankrupt stocks can spike on meme/retail buying — where's your stop?",
+    ],
+    "Contract Loss": [
+        "How big was the lost contract vs. total revenue?",
+        "Was the loss already known or expected?",
+    ],
+    "Deal Collapse": [
+        "Was the stock trading on the buyout price? If so, it may fall back to pre-deal levels.",
+        "Is there a breakup fee being paid TO the company (cushions the drop)?",
+        "Could another bidder step in?",
+    ],
+    "Insider Selling / Exec Exit": [
+        "Is the insider sale part of a pre-planned 10b5-1 schedule (less meaningful)?",
+        "Is the exec departure sudden and unexplained, or a planned retirement?",
+        "An auditor resigning is a big red flag — check for accounting issues.",
+    ],
+    "Recall / Safety": [
+        "How big is the recall relative to the company's sales?",
+        "Is there a regulator involved (FDA/NHTSA), or is it voluntary and small?",
+    ],
+}
+
+SHORT_GENERIC_QUESTIONS = [
+    "Can you even borrow it? Check shortability and the borrow fee with your broker first.",
+    "What's the short interest and days-to-cover? Crowded shorts can squeeze hard.",
+    "What's the float? Low-float stocks can spike 100%+ against you in minutes.",
+    "Short losses are UNLIMITED — where is your stop? (Puts cap your loss at what you pay.)",
+    "Has the stock already dropped on this? Check the price chain above.",
+]
+
+
+def generate_short_trader_analysis(story):
+    """Short-side version of generate_trader_analysis(). Same keys returned.
+    No buy/sell calls — organizes facts and questions."""
+    title = story.get("title", "")
+    summary = story.get("summary", "")
+    text = f"{title}\n{summary}"
+    score = story.get("score", 0)
+    catalysts = story.get("catalysts", [])
+    warnings = story.get("warnings", [])
+    breakdown = story.get("breakdown", [])
+
+    out = {}
+
+    # 1. Claim vs implication
+    claim_parts = []
+    if catalysts:
+        claim_parts.append(f"The short scanner tagged this as: {', '.join(catalysts)}.")
+    soft = []
+    for pat, label in [
+        (r"\bexplor(?:e|es|ing)\b|\bconsidering\b", "'exploring/considering' (nothing decided)"),
+        (r"\bmay\b|\bcould\b|\bpotential(?:ly)?\b", "conditional language ('may'/'could'/'potential')"),
+        (r"\bproposed\b", "'proposed' (not final)"),
+        (r"\bshelf\s+registration\b", "shelf registration (a permission slip, not a sale)"),
+        (r"\bpreliminary\b", "preliminary / unaudited figures"),
+    ]:
+        if re.search(pat, text, re.IGNORECASE):
+            soft.append(label)
+    if soft:
+        claim_parts.append(
+            "⚠️ Soft / hedged language detected: " + "; ".join(soft) +
+            ". The headline may sound worse than the actual news."
+        )
+    else:
+        claim_parts.append("Language appears direct (no obvious hedging).")
+    out["claim_vs_implication"] = " ".join(claim_parts)
+
+    # 2. Score sanity check
+    issues = []
+    counters = [d for d in breakdown if d[1] < 0]
+    if counters:
+        issues.append("bullish language also present (" + ", ".join(d[0] for d in counters[:3]) + ")")
+    if is_lawfirm_spam(title, summary):
+        issues.append("this is a law-firm ad, not a real event")
+    if warnings:
+        issues.append(f"{len(warnings)} price-context warning(s) flagged")
+    if score >= 50 and len(catalysts) <= 1:
+        issues.append("high score from a single catalyst — verify it's as strong as the score implies")
+    if issues:
+        out["sentiment_assessment"] = ("SCORE MAY BE OVERSTATED", "Context suggests caution: " + "; ".join(issues) + ".", "#f59e0b")
+    elif score >= 50 and len(catalysts) >= 2:
+        out["sentiment_assessment"] = ("SCORE LOOKS SUPPORTED", "Multiple independent bearish catalysts back up the score. Still verify the magnitude of each.", "#ef4444")
+    else:
+        out["sentiment_assessment"] = ("SCORE IS A STARTING POINT", "No obvious red flags in the scoring, but the score only reflects headline language — not magnitude or what's priced in.", "#22d3ee")
+
+    out["sector"] = infer_sector(text)
+
+    # 4. Questions
+    questions = []
+    for cat in catalysts:
+        questions.extend(SHORT_CATALYST_QUESTIONS.get(cat, []))
+    seen = set()
+    questions = [q for q in questions if not (q in seen or seen.add(q))]
+    questions.extend(SHORT_GENERIC_QUESTIONS)
+    out["questions"] = questions
+
+    # 5. Red flags = risks to the SHORT
+    red_flags = list(warnings)
+    for pat, flag in [
+        (r"\bshort\s+squeeze\b|\bheavily\s+shorted\b|\bhigh\s+short\s+interest\b", "Squeeze risk — crowded short"),
+        (r"\bmeme\b|\breddit\b|\bwallstreetbets\b|\bretail\s+(?:frenzy|traders)\b", "Meme / retail attention — can spike irrationally"),
+        (r"\bto\s+be\s+acquired\b|\bbuyout\b|\btakeover\b|\btender\s+offer\b", "Takeover talk — price can be pinned or jump on a bid"),
+        (r"\bsub-?penny\b|\$0\.\d{2}\b", "Sub-$1 price — likely hard to borrow"),
+        (r"\bnyse\s+american\b|\botc\b", "Secondary venue — thin liquidity, hard to borrow"),
+        (r"\blow[-\s]float\b|\bsmall\s+float\b", "Low float — violent moves both ways"),
+    ]:
+        if re.search(pat, text, re.IGNORECASE) and flag not in red_flags:
+            red_flags.append(flag)
+    if is_lawfirm_spam(title, summary):
+        red_flags.append("Law-firm press release — usually a reaction to an old drop, not new news")
+    for d in counters:
+        f = f"Bullish counter-signal in story: {d[0]}"
+        if f not in red_flags:
+            red_flags.append(f)
+    out["red_flags"] = red_flags
+
+    # 6. Missing info
+    missing = [
+        "Borrow availability and fee (is it shortable at your broker?)",
+        "Short interest %, days-to-cover, and float",
+        "Whether the drop already happened (pre-market gap size)",
+        "Cash runway — will they need to raise money (more dilution)?",
+    ]
+    if "Offering / Dilution" in catalysts:
+        missing.append("Offering price, size vs. market cap, and whether warrants are attached")
+    if "Earnings Miss" in catalysts or "Guidance Cut" in catalysts:
+        missing.append("The actual numbers vs. estimates (size of the miss / cut)")
+    if "FDA / Trial Failure" in catalysts:
+        missing.append("How much of the company's value depended on this drug")
+    out["missing_info"] = missing
+
+    n = len(red_flags)
+    if n >= 3:
+        out["bottom_line"] = (
+            f"{n} risks to a short here. Shorts can lose more than 100%, so heavy skepticism — "
+            "verify every flag. The score alone does not justify a position."
+        )
+    elif n >= 1:
+        out["bottom_line"] = (
+            f"A credible bearish catalyst with {n} caveat(s). Work through the questions above, "
+            "and remember defined-risk options (puts) cap your loss. The decision is yours."
+        )
+    else:
+        out["bottom_line"] = (
+            "No obvious red flags, but that is not a short signal. The headline can't tell you "
+            "borrow cost, short interest, or what's priced in. Check those before acting."
+        )
+    return out
+
+
 def generate_trader_analysis(story, price_data=None):
     """
     Build a structured senior-trader-style framework for a story.
@@ -2467,6 +3154,9 @@ def generate_trader_analysis(story, price_data=None):
       'missing_info': list[str]
       'bottom_line': str
     """
+    if story.get("mode") == "short":
+        return generate_short_trader_analysis(story)
+
     title = story.get("title", "")
     summary = story.get("summary", "")
     text = f"{title}\n{summary}"
@@ -2767,10 +3457,12 @@ class StoryDetailPanel(tk.Frame):
 
     def _build(self):
         s = self.story
+        mode = s.get("mode", "bull")
+        theme = MODE_THEME.get(mode, MODE_THEME["bull"])
         score = s["score"]
-        score_color = color_for_score(score)
-        has_bearish = any(d[1] < 0 for d in s.get("breakdown", []))
-        label, label_color, label_desc = conviction_label(score, has_bearish)
+        score_color = color_for_mode_score(mode, score)
+        has_counter = any(d[1] < 0 for d in s.get("breakdown", []))
+        label, label_color, label_desc = label_for_mode(mode, score, has_counter)
 
         # Top bar: back button + close
         topbar = tk.Frame(self, bg=PALETTE["bg_alt"], height=44)
@@ -2784,7 +3476,7 @@ class StoryDetailPanel(tk.Frame):
             command=self.on_close, padx=14, pady=8)
         back_btn.pack(side="left", padx=14, pady=6)
 
-        tk.Label(topbar, text="Story Details", bg=PALETTE["bg_alt"],
+        tk.Label(topbar, text=f"Story Details  ·  {theme['word']} VIEW", bg=PALETTE["bg_alt"],
                  fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 10)
                  ).pack(side="left", pady=12)
 
@@ -2934,7 +3626,7 @@ class StoryDetailPanel(tk.Frame):
                 row = tk.Frame(tbl, bg=PALETTE["panel_alt"])
                 row.pack(fill="x", pady=1)
                 sign = "+" if delta >= 0 else ""
-                delta_color = PALETTE["accent_2"] if delta >= 0 else PALETTE["danger"]
+                delta_color = theme["pos"] if delta >= 0 else theme["neg"]
                 tk.Label(row, text=f" {sign}{delta} ",
                          bg=delta_color, fg="#0a0e1c",
                          font=(FONT_DISPLAY, 10, "bold"), width=5
@@ -2952,21 +3644,39 @@ class StoryDetailPanel(tk.Frame):
         self._build_trader_analysis(body, s)
 
         self._section(body, "WHAT THIS SCORE MEANS")
-        disc = (
-            "The Bull Score is a keyword-based heuristic. A high score means the "
-            "headline contains language commonly associated with bullish catalysts "
-            "(earnings beats, FDA approvals, M&A, guidance raises, etc.).\n\n"
-            "A high score is NOT a trade recommendation. The market often prices "
-            "in news before retail traders can react. Headlines can also be "
-            "misleading \u2014 read the source article carefully.\n\n"
-            "Before considering any trade, verify:\n"
-            "   \u2022 The actual numbers (is the beat meaningful or barely above estimates?)\n"
-            "   \u2022 Pre-market price action and volume\n"
-            "   \u2022 Float, short interest, and dilution risk\n"
-            "   \u2022 Whether the news is truly new or already known\n"
-            "   \u2022 Your own risk tolerance and position sizing\n\n"
-            "This tool helps you triage news faster. The decision is yours."
-        )
+        if mode == "short":
+            disc = (
+                "The Short Score is a keyword-based heuristic. A high score means the "
+                "headline contains language commonly associated with bearish catalysts "
+                "(earnings misses, guidance cuts, offerings/dilution, FDA failures, "
+                "downgrades, etc.).\n\n"
+                "A high score is NOT a trade recommendation. Shorting carries UNLIMITED "
+                "risk — a stock can keep rising against you. Bad news is often priced in "
+                "within minutes, and heavily shorted stocks can squeeze violently.\n\n"
+                "Before considering any short, verify:\n"
+                "   \u2022 That the stock is shortable and what the borrow fee is\n"
+                "   \u2022 Short interest, days-to-cover, and float (squeeze risk)\n"
+                "   \u2022 Pre-market price action — has it already dropped?\n"
+                "   \u2022 Whether the news is truly new (law-firm alerts usually aren't)\n"
+                "   \u2022 Your stop, or a defined-risk alternative like buying puts\n\n"
+                "This tool helps you triage news faster. The decision is yours."
+            )
+        else:
+            disc = (
+                "The Bull Score is a keyword-based heuristic. A high score means the "
+                "headline contains language commonly associated with bullish catalysts "
+                "(earnings beats, FDA approvals, M&A, guidance raises, etc.).\n\n"
+                "A high score is NOT a trade recommendation. The market often prices "
+                "in news before retail traders can react. Headlines can also be "
+                "misleading \u2014 read the source article carefully.\n\n"
+                "Before considering any trade, verify:\n"
+                "   \u2022 The actual numbers (is the beat meaningful or barely above estimates?)\n"
+                "   \u2022 Pre-market price action and volume\n"
+                "   \u2022 Float, short interest, and dilution risk\n"
+                "   \u2022 Whether the news is truly new or already known\n"
+                "   \u2022 Your own risk tolerance and position sizing\n\n"
+                "This tool helps you triage news faster. The decision is yours."
+            )
         tk.Label(body, text=disc, bg=PALETTE["bg"], fg=PALETTE["text_dim"],
                  font=(FONT_DISPLAY, 9), anchor="w", justify="left",
                  wraplength=700).pack(fill="x", padx=24, pady=(0, 16))
@@ -3040,10 +3750,12 @@ class StoryDetailPanel(tk.Frame):
             fill = tk.Frame(bar_bg, bg=conf_color, height=8)
             fill.place(relwidth=max(0.02, conf / 100.0), relheight=1.0)
 
+            _is_short = story.get("mode") == "short"
             tk.Label(body,
-                text="Confidence is separate from the Bull Score. It reflects how much to "
-                     "trust the headline at face value — LOW confidence means 'verify before "
-                     "believing', NOT 'bearish'.",
+                text=(f"Confidence is separate from the {'Short' if _is_short else 'Bull'} Score. "
+                      "It reflects how much to trust the headline at face value — LOW confidence "
+                      "means 'verify before believing', NOT "
+                      f"'{'bullish' if _is_short else 'bearish'}'."),
                 bg=PALETTE["bg"], fg=PALETTE["text_mute"],
                 font=(FONT_DISPLAY, 8, "italic"), anchor="w", justify="left", wraplength=700
                 ).pack(fill="x", padx=24, pady=(0, 4))
@@ -3097,14 +3809,17 @@ class StoryDetailPanel(tk.Frame):
         sub("③ Sector / macro context")
         para(f"Inferred sector: {analysis['sector']}. "
              "Consider how the broader sector and macro backdrop (rates, sector rotation, "
-             "risk appetite) are trading today — a great catalyst into a falling sector can still drop.")
+             "risk appetite) are trading today — " +
+             ("bad news into a hot, rising sector can still get bought up."
+              if story.get("mode") == "short" else
+              "a great catalyst into a falling sector can still drop."))
 
         # 4. Questions
         sub("④ Questions to ask before any decision")
         bullet_list(analysis["questions"], color=PALETTE["accent"])
 
         # 5. Red flags
-        sub("⑤ Red flags to watch", color=PALETTE["danger"] if analysis["red_flags"] else PALETTE["accent_hi"])
+        sub("⑤ Risks to the short" if story.get("mode") == "short" else "⑤ Red flags to watch", color=PALETTE["danger"] if analysis["red_flags"] else PALETTE["accent_hi"])
         if analysis["red_flags"]:
             bullet_list(analysis["red_flags"], color=PALETTE["danger"])
         else:
@@ -3681,7 +4396,8 @@ class StoryCard(tk.Frame):
     def _build(self):
         s = self.story
         score = s["score"]
-        bull_color = color_for_score(score)
+        mode = s.get("mode", "bull")
+        bull_color = color_for_mode_score(mode, score)
 
         # Left score column
         left = tk.Frame(self, bg=bull_color, width=6)
@@ -3724,7 +4440,7 @@ class StoryCard(tk.Frame):
                              bg=bull_color, fg="#0a0e1c",
                              font=(FONT_DISPLAY, 11, "bold"))
         score_lbl.pack(side="right")
-        tk.Label(score_wrap, text="BULL  ", bg=PALETTE["panel"],
+        tk.Label(score_wrap, text=f"{MODE_THEME.get(mode, MODE_THEME['bull'])['word']}  ", bg=PALETTE["panel"],
                  fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 8)
                  ).pack(side="right", pady=(2, 0))
 
@@ -3984,6 +4700,9 @@ class PreMarketScanner(tk.Tk):
         self.watchlist = set()           # set of tickers
         self.pinned_stories = set()      # set of story_keys (for stories you bookmarked, may or may not have tickers)
         self.active_categories = set(ALL_CATEGORIES)
+        self.active_short_categories = set(ALL_SHORT_CATEGORIES)
+        self.scan_mode = "bull"                       # "bull" or "short"
+        self._mode_min_scores = {"bull": 20, "short": 20}
         self.min_score = tk.IntVar(value=20)
         self.show_only_watchlist = tk.BooleanVar(value=False)
         self.auto_refresh = tk.BooleanVar(value=True)
@@ -4014,10 +4733,17 @@ class PreMarketScanner(tk.Tk):
                 data = json.load(f)
             self.watchlist = set(data.get("watchlist", []))
             self.pinned_stories = set(data.get("pinned_stories", []))
-            self.min_score.set(int(data.get("min_score", 20)))
+            self._mode_min_scores["bull"] = int(data.get("min_score", 20))
+            self._mode_min_scores["short"] = int(data.get("short_min_score", 20))
             cats = data.get("categories")
             if cats:
                 self.active_categories = set(c for c in cats if c in ALL_CATEGORIES)
+            scats = data.get("short_categories")
+            if scats:
+                self.active_short_categories = set(c for c in scats if c in ALL_SHORT_CATEGORIES)
+            mode = data.get("scan_mode", "bull")
+            self.scan_mode = mode if mode in ("bull", "short") else "bull"
+            self.min_score.set(self._mode_min_scores[self.scan_mode])
             self.show_only_watchlist.set(bool(data.get("only_watchlist", False)))
             self.auto_refresh.set(bool(data.get("auto_refresh", True)))
         except Exception as e:
@@ -4025,12 +4751,19 @@ class PreMarketScanner(tk.Tk):
 
     def _save_settings(self):
         try:
+            self._mode_min_scores[self.scan_mode] = int(self.min_score.get())
+        except Exception:
+            pass
+        try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump({
                     "watchlist": sorted(self.watchlist),
                     "pinned_stories": sorted(self.pinned_stories),
-                    "min_score": int(self.min_score.get()),
+                    "min_score": int(self._mode_min_scores["bull"]),
+                    "short_min_score": int(self._mode_min_scores["short"]),
                     "categories": sorted(self.active_categories),
+                    "short_categories": sorted(self.active_short_categories),
+                    "scan_mode": self.scan_mode,
                     "only_watchlist": bool(self.show_only_watchlist.get()),
                     "auto_refresh": bool(self.auto_refresh.get()),
                 }, f, indent=2)
@@ -4047,13 +4780,16 @@ class PreMarketScanner(tk.Tk):
 
         hleft = tk.Frame(header, bg=PALETTE["bg_alt"])
         hleft.pack(side="left", padx=24, pady=14)
-        tk.Label(hleft, text="◆  BULL SCANNER",
-                 bg=PALETTE["bg_alt"], fg=PALETTE["accent"],
-                 font=(FONT_DISPLAY, 17, "bold")
-                 ).pack(anchor="w")
-        tk.Label(hleft, text="Pre-market catalyst detection  ·  4:00–9:30 AM ET",
+        theme = MODE_THEME[self.scan_mode]
+        self.title(theme["window"])
+        self.header_title_lbl = tk.Label(hleft, text=theme["title"],
+                 bg=PALETTE["bg_alt"], fg=theme["accent"],
+                 font=(FONT_DISPLAY, 17, "bold"))
+        self.header_title_lbl.pack(anchor="w")
+        self.header_sub_lbl = tk.Label(hleft, text=theme["sub"],
                  bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
-                 font=(FONT_DISPLAY, 9)).pack(anchor="w", pady=(2, 0))
+                 font=(FONT_DISPLAY, 9))
+        self.header_sub_lbl.pack(anchor="w", pady=(2, 0))
 
         status_frame = tk.Frame(header, bg=PALETTE["bg_alt"])
         status_frame.pack(side="right", padx=24, pady=14)
@@ -4094,13 +4830,26 @@ class PreMarketScanner(tk.Tk):
         # divider
         tk.Frame(parent, bg=PALETTE["border"], width=1).pack(side="left", fill="y")
 
+        # ─── BULL / SHORT mode toggle ───
+        mode_row = tk.Frame(side, bg=PALETTE["bg_alt"])
+        mode_row.pack(fill="x", padx=18, pady=(14, 0))
+        self.mode_bull_btn = tk.Button(mode_row, text="🐂  BULL",
+            font=(FONT_DISPLAY, 10, "bold"), bd=0, relief="flat", cursor="hand2",
+            command=lambda: self._set_scan_mode("bull"), padx=6, pady=6)
+        self.mode_bull_btn.pack(side="left", fill="x", expand=True, padx=(0, 3))
+        self.mode_short_btn = tk.Button(mode_row, text="🐻  SHORT",
+            font=(FONT_DISPLAY, 10, "bold"), bd=0, relief="flat", cursor="hand2",
+            command=lambda: self._set_scan_mode("short"), padx=6, pady=6)
+        self.mode_short_btn.pack(side="left", fill="x", expand=True, padx=(3, 0))
+        self._style_mode_buttons()
+
         # Refresh button
         self.refresh_btn = tk.Button(side, text="⟳   REFRESH NOW",
             bg=PALETTE["accent"], fg="#0a0e1c",
             font=(FONT_DISPLAY, 10, "bold"), bd=0, relief="flat",
             activebackground=PALETTE["accent_hi"], cursor="hand2",
             command=self._manual_refresh, padx=10, pady=12)
-        self.refresh_btn.pack(fill="x", padx=18, pady=(20, 8))
+        self.refresh_btn.pack(fill="x", padx=18, pady=(10, 8))
 
         tk.Checkbutton(side, text="Auto-refresh every 5 min (pre-market)",
             variable=self.auto_refresh, bg=PALETTE["bg_alt"],
@@ -4144,11 +4893,12 @@ class PreMarketScanner(tk.Tk):
             ).pack(fill="x", padx=18, pady=(4, 0))
 
         # Min score
-        self._section_header(side, "MIN BULL SCORE")
+        self.min_score_hdr = self._section_header(
+            side, f"MIN {MODE_THEME[self.scan_mode]['word']} SCORE")
         srow = tk.Frame(side, bg=PALETTE["bg_alt"])
         srow.pack(fill="x", padx=18)
         self.score_value_lbl = tk.Label(srow, text=f"{self.min_score.get()}+",
-            bg=PALETTE["bg_alt"], fg=PALETTE["accent"],
+            bg=PALETTE["bg_alt"], fg=MODE_THEME[self.scan_mode]["accent"],
             font=(FONT_DISPLAY, 16, "bold"))
         self.score_value_lbl.pack(side="left")
         tk.Label(srow, text="threshold", bg=PALETTE["bg_alt"],
@@ -4160,12 +4910,34 @@ class PreMarketScanner(tk.Tk):
             ).pack(fill="x", padx=18, pady=(4, 10))
 
         # Categories
-        self._section_header(side, "CATALYST CATEGORIES")
+        self.cat_hdr = self._section_header(
+            side, "SHORT CATALYSTS" if self.scan_mode == "short" else "CATALYST CATEGORIES")
         self.category_vars = {}
-        cat_frame = tk.Frame(side, bg=PALETTE["bg_alt"])
-        cat_frame.pack(fill="both", expand=True, padx=18, pady=(0, 10))
-        for cat in ALL_CATEGORIES:
-            var = tk.BooleanVar(value=cat in self.active_categories)
+        self.cat_frame = tk.Frame(side, bg=PALETTE["bg_alt"])
+        self.cat_frame.pack(fill="both", expand=True, padx=18, pady=(0, 10))
+        self._build_category_list()
+
+        # Updater section
+        self._section_header(side, "APP UPDATES")
+        self.update_btn = tk.Button(side, text="⤓  CHECK FOR UPDATES",
+            bg=PALETTE["panel"], fg=PALETTE["accent"],
+            font=(FONT_DISPLAY, 9, "bold"), bd=0, relief="flat",
+            activebackground=PALETTE["panel_hover"], cursor="hand2",
+            command=self._manual_update_check, padx=10, pady=8)
+        self.update_btn.pack(fill="x", padx=18, pady=(0, 16))
+
+    def _build_category_list(self):
+        """(Re)build the category checkboxes for the active scan mode."""
+        for child in self.cat_frame.winfo_children():
+            child.destroy()
+        self.category_vars = {}
+        if self.scan_mode == "short":
+            all_cats, active = ALL_SHORT_CATEGORIES, self.active_short_categories
+        else:
+            all_cats, active = ALL_CATEGORIES, self.active_categories
+        cat_frame = self.cat_frame
+        for cat in all_cats:
+            var = tk.BooleanVar(value=cat in active)
             self.category_vars[cat] = var
             row = tk.Frame(cat_frame, bg=PALETTE["bg_alt"])
             row.pack(fill="x", anchor="w", pady=1)
@@ -4182,20 +4954,13 @@ class PreMarketScanner(tk.Tk):
                 command=self._on_category_change
                 ).pack(side="left", anchor="w")
 
-        # Updater section
-        self._section_header(side, "APP UPDATES")
-        self.update_btn = tk.Button(side, text="⤓  CHECK FOR UPDATES",
-            bg=PALETTE["panel"], fg=PALETTE["accent"],
-            font=(FONT_DISPLAY, 9, "bold"), bd=0, relief="flat",
-            activebackground=PALETTE["panel_hover"], cursor="hand2",
-            command=self._manual_update_check, padx=10, pady=8)
-        self.update_btn.pack(fill="x", padx=18, pady=(0, 16))
-
     def _section_header(self, parent, text):
         tk.Frame(parent, bg=PALETTE["border"], height=1).pack(fill="x", padx=14, pady=(18, 8))
-        tk.Label(parent, text=text, bg=PALETTE["bg_alt"],
+        lbl = tk.Label(parent, text=text, bg=PALETTE["bg_alt"],
             fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 8, "bold"),
-            anchor="w").pack(fill="x", padx=18, pady=(0, 6))
+            anchor="w")
+        lbl.pack(fill="x", padx=18, pady=(0, 6))
+        return lbl
 
     def _build_results(self, parent):
         self._results_parent = parent
@@ -4277,7 +5042,11 @@ class PreMarketScanner(tk.Tk):
         self._save_settings()
 
     def _on_category_change(self):
-        self.active_categories = {c for c, v in self.category_vars.items() if v.get()}
+        chosen = {c for c, v in self.category_vars.items() if v.get()}
+        if self.scan_mode == "short":
+            self.active_short_categories = chosen
+        else:
+            self.active_categories = chosen
         self._apply_filters()
         self._save_settings()
 
@@ -4313,8 +5082,13 @@ class PreMarketScanner(tk.Tk):
     def _apply_filters(self):
         min_score = int(self.min_score.get())
         only_watch = self.show_only_watchlist.get()
-        cats = self.active_categories
+        cats = self.active_short_categories if self.scan_mode == "short" else self.active_categories
         view = self.view_mode.get() if hasattr(self, "view_mode") else "live"
+
+        # Make every story show the active mode's score/catalysts/etc.
+        for s in self.stories:
+            if s.get("mode") != self.scan_mode:
+                project_story_mode(s, self.scan_mode)
 
         filtered = []
         for s in self.stories:
@@ -4370,7 +5144,8 @@ class PreMarketScanner(tk.Tk):
             else:
                 empty_msg = (
                     "\n\n\n No stories match your filters.\n "
-                    "Try lowering the bull score or expanding categories.\n"
+                    f"Try lowering the {MODE_THEME[self.scan_mode]['word'].lower()} score "
+                    "or expanding categories.\n"
                 )
             tk.Label(self.cards_frame, text=empty_msg,
                 bg=PALETTE["bg"], fg=PALETTE["text_mute"],
@@ -4457,9 +5232,50 @@ class PreMarketScanner(tk.Tk):
             self.view_hint.config(text="   Stories you've pinned + tickers you're tracking. Click a story for outcome details.")
         self._apply_filters()
 
+    # ─────────── Bull / Short mode ───────────
+    def _style_mode_buttons(self):
+        on_bull = self.scan_mode == "bull"
+        self.mode_bull_btn.config(
+            bg=MODE_THEME["bull"]["accent"] if on_bull else PALETTE["panel"],
+            fg="#0a0e1c" if on_bull else PALETTE["text_dim"],
+            activebackground=MODE_THEME["bull"]["accent_hi"])
+        self.mode_short_btn.config(
+            bg=MODE_THEME["short"]["accent"] if not on_bull else PALETTE["panel"],
+            fg="#0a0e1c" if not on_bull else PALETTE["text_dim"],
+            activebackground=MODE_THEME["short"]["accent_hi"])
+
+    def _set_scan_mode(self, mode):
+        """Switch between BULL and SHORT scanning. No re-fetch needed — every
+        story was already scored both ways."""
+        if mode not in ("bull", "short") or mode == self.scan_mode:
+            return
+        # Remember the slider position for the mode we're leaving
+        self._mode_min_scores[self.scan_mode] = int(self.min_score.get())
+        self.scan_mode = mode
+        theme = MODE_THEME[mode]
+
+        self.min_score.set(self._mode_min_scores[mode])
+        self.score_value_lbl.config(text=f"{self.min_score.get()}+", fg=theme["accent"])
+        self.min_score_hdr.config(text=f"MIN {theme['word']} SCORE")
+        self.cat_hdr.config(text="SHORT CATALYSTS" if mode == "short" else "CATALYST CATEGORIES")
+        self._build_category_list()
+
+        self.header_title_lbl.config(text=theme["title"], fg=theme["accent"])
+        self.header_sub_lbl.config(text=theme["sub"])
+        self.title(theme["window"])
+        self._style_mode_buttons()
+
+        # Close any open detail panel (it was built for the other mode)
+        if getattr(self, "_detail_panel", None):
+            self._hide_detail_panel()
+
+        LOGGER.info(f"Scan mode -> {mode.upper()}")
+        self._apply_filters()
+        self._save_settings()
+
     def _on_card_click(self, story):
         LOGGER.info(
-            f"OPENED | score={story['score']} | "
+            f"OPENED | mode={story.get('mode', 'bull')} | score={story['score']} | "
             f"tickers={','.join(story.get('tickers', [])) or '-'} | "
             f"cats={','.join(story.get('catalysts', [])) or '-'} | "
             f"{story['source']} | {story['title']}"
@@ -4558,24 +5374,23 @@ class PreMarketScanner(tk.Tk):
             stories = kept
 
             for s in stories:
-                score, cats, breakdown = score_story(s["title"], s.get("summary", ""))
-                s["score"] = score
-                s["catalysts"] = cats
-                s["breakdown"] = breakdown
                 s["tickers"] = extract_tickers(f"{s['title']} {s.get('summary', '')}")
                 s["watch_match"] = bool(self.watchlist & set(s["tickers"]))
                 s["story_key"] = re.sub(r"[^a-z0-9]+", "", s["title"].lower())[:120]
                 s["pinned"] = s["story_key"] in pinned_keys_snapshot
-                s["warnings"] = []
+
+                # ─── Score BOTH ways (bull + short) in one pass ───
+                modes = score_story_both_ways(s)
+                bull, short = modes["bull"], modes["short"]
 
                 # ─── Price-context scoring ───
                 # Apply live-price bonuses ONLY when worth the network cost:
                 # - M&A / Buyout catalyst tag (need to check premium) OR
-                # - Base score already meaningful (>=25) AND has a ticker
-                # This caps Yahoo calls to roughly the same number of stories
-                # we already persist.
+                # - Either score already meaningful (>=25) AND has a ticker
+                # One fetch is shared by both modes.
                 if s["tickers"] and (
-                    "M&A / Buyout" in cats or score >= 25 or s["pinned"]
+                    "M&A / Buyout" in bull["catalysts"] or bull["score"] >= 25
+                    or short["score"] >= 25 or s["pinned"]
                 ):
                     first_ticker = s["tickers"][0]
                     try:
@@ -4586,24 +5401,32 @@ class PreMarketScanner(tk.Tk):
                         LOGGER.debug(f"Price context fetch failed for {first_ticker}: {e}")
                         price_data = None
 
-                    new_score, new_breakdown, warnings = apply_price_context(
-                        score, list(breakdown), s, price_data
-                    )
-                    if new_score != score or warnings:
-                        s["score"] = new_score
-                        s["breakdown"] = new_breakdown
-                        s["warnings"] = warnings
+                    # Each mode only gets price context under its OWN original
+                    # trigger rule, so bull scores behave exactly as before.
+                    if "M&A / Buyout" in bull["catalysts"] or bull["score"] >= 25 or s["pinned"]:
+                        b_score, b_bd, b_warn = apply_price_context(
+                            bull["score"], list(bull["breakdown"]), s, price_data)
+                        bull.update(score=b_score, breakdown=b_bd, warnings=b_warn)
 
-                # ─── Confidence meter (separate from bull score) ───
-                conf_pct, conf_level, conf_color, conf_reasons = compute_confidence(s)
-                s["confidence"] = conf_pct
-                s["confidence_level"] = conf_level
-                s["confidence_color"] = conf_color
-                s["confidence_reasons"] = conf_reasons
+                    if short["score"] >= 25 or s["pinned"]:
+                        s_score, s_bd, s_warn = apply_short_price_context(
+                            short["score"], list(short["breakdown"]), s, price_data)
+                        short.update(score=s_score, breakdown=s_bd, warnings=s_warn)
+
+                # ─── Confidence meter (separate from the scores, per mode) ───
+                attach_confidence(s, bull, "bull")
+                attach_confidence(s, short, "short")
+                s["bull"] = bull
+                s["short"] = short
+
+                # Top-level fields default to BULL (that's what the DB stores);
+                # the UI re-projects to the active mode on the main thread.
+                project_story_mode(s, "bull")
 
                 # Persist if: high-scoring OR user has pinned this story.
                 # Pinned stories should never be lost even if score is 0.
-                should_persist = (s["score"] >= PERSIST_MIN_SCORE) or s["pinned"]
+                should_persist = (max(bull["score"], short["score"]) >= PERSIST_MIN_SCORE) \
+                                 or s["pinned"]
                 if should_persist:
                     story_id = db_save_story(s)
                     s["db_id"] = story_id
@@ -4704,12 +5527,17 @@ class PreMarketScanner(tk.Tk):
                 p["breakdown"] = []
                 p["watch_match"] = bool(self.watchlist & set(p.get("tickers", [])))
                 p["pinned"] = is_pinned
-                if "confidence" not in p:
-                    cpct, clevel, ccolor, creasons = compute_confidence(p)
-                    p["confidence"] = cpct
-                    p["confidence_level"] = clevel
-                    p["confidence_color"] = ccolor
-                    p["confidence_reasons"] = creasons
+                # Bull = what the DB stored (may include price context).
+                # Short = re-scored from text (cheap, no network).
+                p_bull = {"score": p.get("score", 0), "catalysts": p.get("catalysts", []),
+                          "breakdown": [], "warnings": []}
+                ss, sc, sb = score_short_story(p["title"], p.get("summary", ""))
+                p_short = {"score": ss, "catalysts": sc, "breakdown": sb, "warnings": []}
+                attach_confidence(p, p_bull, "bull")
+                attach_confidence(p, p_short, "short")
+                p["bull"] = p_bull
+                p["short"] = p_short
+                project_story_mode(p, "bull")
                 stories.append(p)
 
             self.fetch_queue.put(("done", stories))
@@ -4745,12 +5573,13 @@ class PreMarketScanner(tk.Tk):
         for s in stories:
             if self._story_key(s) in prev_keys:
                 continue
+            project_story_mode(s, self.scan_mode)
             if s["score"] >= 40 or s.get("watch_match"):
                 new_alerts.append(s)
 
         for s in new_alerts:
             LOGGER.info(
-                f"ALERT | score={s['score']} | "
+                f"ALERT | mode={self.scan_mode} | score={s['score']} | "
                 f"tickers={','.join(s.get('tickers', [])) or '-'} | "
                 f"cats={','.join(s.get('catalysts', [])) or '-'} | "
                 f"watch={'Y' if s.get('watch_match') else 'N'} | "
