@@ -18,6 +18,7 @@ Run:          python premarket_scanner.py
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
+import time
 import queue
 import re
 import os
@@ -57,7 +58,15 @@ ET_ZONE = ZoneInfo("America/New_York")
 LOG_FILE = os.path.join(os.path.expanduser("~"), "premarket_alerts.log")
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".premarket_scanner.json")
 DB_FILE = os.path.join(os.path.expanduser("~"), ".premarket_stories.db")
-REFRESH_INTERVAL_SEC = 300
+REFRESH_INTERVAL_SEC = 300          # (legacy) slow-feed interval
+REFRESH_FAST_SEC = 60               # auto-refresh in pre-market & after-hours
+REFRESH_REGULAR_SEC = 120           # auto-refresh during regular market hours
+# Press-release wires + SEC filings are where news lands first — poll them every
+# refresh. Everything else (journalism/aggregators) is re-fetched every 5 min.
+FAST_FEED_SOURCES = {"GlobeNewswire", "PR Newswire", "Business Wire", "SEC EDGAR", "Benzinga"}
+FAST_FEED_MIN_SEC = 55
+SLOW_FEED_MIN_SEC = 295
+SEC_USER_AGENT = "BullScanner contact@example.com"   # SEC requires a declared UA
 MAX_STORIES = 80
 PERSIST_MIN_SCORE = 30   # stories at/above this score get saved to DB
 USER_AGENT = "Mozilla/5.0 (PremarketScanner/1.0)"
@@ -65,7 +74,7 @@ HTTP_TIMEOUT = 15
 
 # ─── Auto-updater ─────────────────────────────────────────────────────────────
 UPDATE_URL = "https://raw.githubusercontent.com/jowfred/bullscan/main/premarket_scanner.py"
-APP_VERSION = "3.12.0"
+APP_VERSION = "3.13.0"
 UPDATE_CHECK_ON_LAUNCH = True
 
 RSS_FEEDS = {
@@ -119,9 +128,6 @@ RSS_FEEDS = {
     "AP Business": [
         "https://rsshub.app/apnews/topics/business",
     ],
-    "FinancialJuice": [
-        "https://www.financialjuice.com/feeds/rss/news.aspx",
-    ],
 }
 
 # ─── Source quality tiers ─────────────────────────────────────────────────────
@@ -142,7 +148,6 @@ SOURCE_TIERS = {
     "Benzinga":      (3, "Fast but noisy", "#f59e0b"),
     "Seeking Alpha": (3, "Opinion / analysis", "#f59e0b"),
     "Motley Fool":   (3, "Opinion / analysis", "#f59e0b"),
-    "FinancialJuice":(3, "Breaking-news feed", "#a3a3a3"),
 }
 
 def source_tier(source):
@@ -515,11 +520,11 @@ MODE_THEME = {
     "bull":  {"word": "BULL",  "title": "◆  BULL SCANNER",  "accent": "#22d3ee",
               "accent_hi": "#67e8f9", "pos": "#10b981", "neg": "#ef4444",
               "window": "Pre-Market Bullish News Scanner",
-              "sub": "Pre-market catalyst detection  ·  4:00–9:30 AM ET"},
+              "sub": "Catalyst detection  ·  pre-market, market hours & after-hours"},
     "short": {"word": "SHORT", "title": "▼  SHORT SCANNER", "accent": "#f87171",
               "accent_hi": "#fca5a5", "pos": "#ef4444", "neg": "#10b981",
               "window": "Pre-Market Short Scanner",
-              "sub": "Bearish catalyst detection  ·  4:00–9:30 AM ET"},
+              "sub": "Bearish catalyst detection  ·  pre-market, market hours & after-hours"},
 }
 
 # ───────────────────────────── UTILITIES ──────────────────────────────────────
@@ -564,6 +569,28 @@ def is_premarket_now():
     start = now_et.replace(hour=4, minute=0, second=0, microsecond=0)
     end = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     return start <= now_et <= end
+
+def market_session_now():
+    """'premarket' 4:00-9:30, 'regular' 9:30-16:00, 'afterhours' 16:00-20:00 ET
+    on weekdays; otherwise 'closed'."""
+    now_et = datetime.now(ET_ZONE)
+    if now_et.weekday() >= 5:
+        return "closed"
+    hm = now_et.hour * 60 + now_et.minute
+    if 4 * 60 <= hm < 9 * 60 + 30:
+        return "premarket"
+    if 9 * 60 + 30 <= hm < 16 * 60:
+        return "regular"
+    if 16 * 60 <= hm < 20 * 60:
+        return "afterhours"
+    return "closed"
+
+def refresh_interval_for(session):
+    if session in ("premarket", "afterhours"):
+        return REFRESH_FAST_SEC
+    if session == "regular":
+        return REFRESH_REGULAR_SEC
+    return None
 
 def _market_open_passed_today():
     """True if it's a weekday and at least 9:30 AM ET has passed today.
@@ -949,6 +976,35 @@ def fetch_price_timeline(ticker, story_time_utc=None):
         return None
 
 
+def detect_move_start(candles, from_ts, to_ts, threshold_pct=5.0, window_sec=600):
+    """Find the first SUDDEN price move (>= threshold_pct within window_sec)
+    between from_ts and to_ts. Returns (start_candle, ref_price, pct) or None.
+
+    Used to show when the price ACTUALLY started moving — news often hits the
+    market (via faster sources) well before an RSS feed publishes it."""
+    seg = [c for c in candles if from_ts <= c["ts"] <= to_ts and c.get("close")]
+    if len(seg) < 2:
+        return None
+    j = 0
+    for i, c in enumerate(seg):
+        while seg[j]["ts"] < c["ts"] - window_sec:
+            j += 1
+        ref = seg[j]["close"]
+        if not ref:
+            continue
+        pct = (c["close"] - ref) / ref * 100
+        if abs(pct) >= threshold_pct:
+            # Walk back to the first candle that had moved at least half-way
+            start = c
+            for k in range(j, i + 1):
+                pk = (seg[k]["close"] - ref) / ref * 100
+                if abs(pk) >= threshold_pct / 2 and (pk > 0) == (pct > 0):
+                    start = seg[k]
+                    break
+            return start, ref, pct
+    return None
+
+
 def build_news_event_chain(timeline, story_time_utc):
     """
     Build a chronological event chain anchored on a news drop time.
@@ -1022,6 +1078,13 @@ def build_news_event_chain(timeline, story_time_utc):
 
     baseline_price = prior_regular_close["close"] if prior_regular_close else None
 
+    # ─── Did the price move BEFORE the scanner saw the story? ─────────────
+    # (Faster sources often break news minutes or hours before RSS feeds.)
+    move = None
+    move_from = prior_regular_close["ts"] if prior_regular_close else story_ts - 6 * 3600
+    if story_ts - move_from > 300:
+        move = detect_move_start(candles, move_from, story_ts - 120)
+
     # ─── 2. Prior after-hours close (if exists between prior_regular_close and news) ──
     prior_afterhours_close = None
     if prior_regular_close:
@@ -1031,6 +1094,22 @@ def build_news_event_chain(timeline, story_time_utc):
             if classify(c["ts"]) == "afterhours":
                 prior_afterhours_close = c
                 break
+
+    if prior_afterhours_close and move and prior_afterhours_close["ts"] >= move[0]["ts"]:
+        prior_afterhours_close = None   # it's AFTER the real move — not a "before" price
+
+    if move:
+        start_c, ref_price, mv_pct = move
+        add_event(
+            "PRICE MOVE STARTED",
+            start_c["ts"],
+            start_c["close"],
+            "move_start",
+            baseline=baseline_price,
+            emphasized=True,
+        )
+        events[-1]["move_pct_window"] = mv_pct
+        events[-1]["move_ref_price"] = ref_price
 
     if prior_afterhours_close:
         add_event(
@@ -1054,14 +1133,24 @@ def build_news_event_chain(timeline, story_time_utc):
         news_ts = nearest["ts"]
 
     if news_price:
+        # Use the story's REAL time — not the last candle's time. If the story
+        # landed after the session closed, the price is just the last trade.
         add_event(
-            "NEWS BREAKS",
-            news_ts,
+            "SCANNER SAW STORY" if move else "NEWS BREAKS",
+            story_ts,
             news_price,
             "news_drop",
             baseline=baseline_price,
             emphasized=True,
         )
+        gap = story_ts - news_ts
+        if gap > 300:
+            events[-1]["note"] = (f"no trading at this time — price is the last trade at "
+                                  f"{datetime.fromtimestamp(news_ts, ET_ZONE).strftime('%I:%M %p')}")
+        if move:
+            lag_min = int((story_ts - move[0]["ts"]) / 60)
+            h, m = divmod(lag_min, 60)
+            events[-1]["lag_note"] = f"{h}h {m}m after the price started moving" if h else f"{m} min after the price started moving"
 
     # ─── 4. Pre-market activity after news (if applicable) ────────────────
     post_news_premarket = [c for c in after if classify(c["ts"]) == "premarket"]
@@ -1135,6 +1224,7 @@ def build_news_event_chain(timeline, story_time_utc):
                 emphasized=True,
             )
 
+    events.sort(key=lambda e: e["time_et"])
     return events
 
 
@@ -1204,6 +1294,80 @@ def fetch_quote(ticker):
     _PRICE_CACHE[ticker] = (now, None)
     return None
 
+
+# ───────────────────────────── PRICE-SPIKE ALARM ──────────────────────────────
+# News feeds are slow; prices aren't. Every minute (pre-market, market hours and
+# after-hours) the app checks a short list of tickers you care about and alerts
+# when one jumps or drops sharply — often BEFORE the story reaches any feed.
+
+SPIKE_PCT = 10.0            # sudden move threshold...
+SPIKE_WINDOW_SEC = 15 * 60  # ...within this many minutes
+DAY_MOVE_PCT = 15.0         # catch-up alert: already moved this much today
+SPIKE_MAX_TICKERS = 30
+SPIKE_COOLDOWN_SEC = 30 * 60
+
+
+def fetch_live_bars(ticker):
+    """Today's 1-minute bars INCLUDING pre-market and after-hours.
+    Returns {'bars': [(ts, close)], 'prev_close': float|None} or None."""
+    try:
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(ticker)}"
+               f"?interval=1m&range=1d&includePrePost=true")
+        req = Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+        })
+        with urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+        result = (data.get("chart", {}).get("result") or [None])[0]
+        if not result:
+            return None
+        ts_list = result.get("timestamp") or []
+        closes = ((result.get("indicators", {}).get("quote") or [{}])[0].get("close")) or []
+        bars = [(t, float(c)) for t, c in zip(ts_list, closes) if c is not None]
+        meta = result.get("meta", {}) or {}
+        prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+        return {"bars": bars, "prev_close": float(prev) if prev else None}
+    except Exception as e:
+        LOGGER.debug(f"live bars failed for {ticker}: {e}")
+        return None
+
+
+def detect_spike(bars, prev_close=None, now_ts=None,
+                 spike_pct=SPIKE_PCT, window_sec=SPIKE_WINDOW_SEC, day_pct=DAY_MOVE_PCT):
+    """Look at today's 1-min bars. Returns an alert dict or None.
+      kind 'sudden': moved >= spike_pct within window_sec (ending at the last bar)
+      kind 'day':    already >= day_pct vs. the session baseline (catch-up)"""
+    if not bars or len(bars) < 2:
+        return None
+    now_ts = now_ts or datetime.now(timezone.utc).timestamp()
+    last_ts, last = bars[-1]
+    if now_ts - last_ts > 20 * 60:      # stale — nothing trading right now
+        return None
+    window = [b for b in bars if b[0] >= last_ts - window_sec]
+    if len(window) >= 2:
+        # Biggest swing from any point in the window to the last price
+        ref_ts, ref = max(window[:-1], key=lambda b: abs(last - b[1]))
+        if ref:
+            pct = (last - ref) / ref * 100
+            if abs(pct) >= spike_pct:
+                return {"kind": "sudden", "pct": pct, "from_price": ref, "to_price": last,
+                        "from_ts": ref_ts, "ts": last_ts}
+    # Baseline: today's regular close if we're past it (after-hours), else prior close
+    baseline = prev_close
+    for t, c in reversed(bars):
+        dt = datetime.fromtimestamp(t, ET_ZONE)
+        hm = dt.hour * 60 + dt.minute
+        if 9 * 60 + 30 <= hm < 16 * 60 and datetime.fromtimestamp(last_ts, ET_ZONE).hour >= 16:
+            baseline = c
+            break
+    if baseline:
+        pct = (last - baseline) / baseline * 100
+        if abs(pct) >= day_pct:
+            return {"kind": "day", "pct": pct, "from_price": baseline, "to_price": last,
+                    "from_ts": None, "ts": last_ts}
+    return None
+
 # ───────────────────────────── STORY DATABASE ─────────────────────────────────
 
 def db_connect():
@@ -1235,6 +1399,18 @@ def db_connect():
             change_pct  REAL,
             kind        TEXT,        -- 'headline' | 'open' | 'review'
             FOREIGN KEY (story_id) REFERENCES stories(id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fda_events (
+            ticker      TEXT,
+            event_date  TEXT,        -- YYYY-MM-DD
+            kind        TEXT,        -- 'PDUFA' | 'AdCom'
+            drug        TEXT,
+            source      TEXT,        -- headline it came from, or 'Added by you'
+            link        TEXT,
+            found_at    TEXT,        -- UTC ISO
+            PRIMARY KEY (ticker, event_date, kind)
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_session ON stories(session_date)")
@@ -1366,6 +1542,166 @@ def db_purge_old(days=14):
             LOGGER.info(f"Purged {deleted} old stories from DB.")
     except Exception as e:
         LOGGER.warning(f"db_purge_old failed: {e}")
+
+
+# ─────────────────────────── FDA DECISION CALENDAR ────────────────────────────
+# There's no free official PDUFA calendar (the FDA doesn't publish one), so
+# BullScan builds its own: every story it reads is checked for phrases like
+# "PDUFA target action date of November 22, 2026". You can also add dates by hand.
+
+_MONTHS = (r"january|february|march|april|may|june|july|august|september|"
+           r"october|november|december|jan\.?|feb\.?|mar\.?|apr\.?|jun\.?|jul\.?|"
+           r"aug\.?|sep\.?|sept\.?|oct\.?|nov\.?|dec\.?")
+_RE_DATE_LONG = re.compile(rf"\b({_MONTHS})\s+(\d{{1,2}}),?\s+(20\d\d)\b", re.IGNORECASE)
+_RE_PDUFA_TRIGGER = re.compile(
+    r"\bpdufa\b|\btarget\s+action\s+date\b|\bgoal\s+date\b|\bfda\s+decision\s+(?:date|expected)\b",
+    re.IGNORECASE)
+_RE_ADCOM_TRIGGER = re.compile(
+    r"\badvisory\s+committee\s+(?:meeting|panel)\b|\badcom\b", re.IGNORECASE)
+_RE_DRUG_NAMES = [
+    # "Deramiocel Biologics License Application", "Zorbex NDA"
+    re.compile(r"\b([A-Z][A-Za-z0-9\-]{3,})\s+(?:\(\w+\)\s+)?(?:Biologics\s+License\s+Application|New\s+Drug\s+Application|s?BLA|s?NDA)\b"),
+    # "BLA for Deramiocel", "NDA for Lumivax"
+    re.compile(r"\b(?:Biologics\s+License\s+Application|New\s+Drug\s+Application|s?BLA|s?NDA)\s+(?:\(\w+\)\s+)?for\s+(?:its\s+)?([A-Z][A-Za-z0-9\-]{3,})"),
+    # "... for Zorbex"
+    re.compile(r"\bfor\s+(?:its\s+)?([A-Z][A-Za-z0-9\-]{3,})"),
+]
+_DRUG_STOPWORDS = {"Duchenne", "Prescription", "Drug", "Biologics", "Food", "Administration",
+                   "Phase", "Treatment", "Patients", "Adults", "Children", "Fiscal", "Quarter"}
+
+
+def _parse_long_date(m):
+    mon = m.group(1).lower().rstrip(".")[:3]
+    months = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"]
+    try:
+        return datetime(int(m.group(3)), months.index(mon) + 1, int(m.group(2))).date()
+    except (ValueError, IndexError):
+        return None
+
+
+def extract_fda_events(text):
+    """Find FDA decision / AdCom dates in text. Returns [(kind, date, drug_or_'')].
+    Only dates within ~180 chars of a trigger phrase count (conservative)."""
+    if not text:
+        return []
+    out = []
+    today = datetime.now(ET_ZONE).date()
+    for kind, trig in (("PDUFA", _RE_PDUFA_TRIGGER), ("AdCom", _RE_ADCOM_TRIGGER)):
+        for tm in trig.finditer(text):
+            window = text[max(0, tm.start() - 60): tm.end() + 180]
+            for dm in _RE_DATE_LONG.finditer(window):
+                d = _parse_long_date(dm)
+                if not d:
+                    continue
+                # Must be upcoming (or just happened) and within ~1.5 years
+                if d < today - timedelta(days=3) or d > today + timedelta(days=550):
+                    continue
+                drug = ""
+                ctx = text[max(0, tm.start() - 250): tm.end() + 150]
+                for rx in _RE_DRUG_NAMES:
+                    for dmatch in rx.finditer(ctx):
+                        cand = dmatch.group(1).strip()
+                        if cand not in _DRUG_STOPWORDS:
+                            drug = cand[:40]
+                            break
+                    if drug:
+                        break
+                ev = (kind, d, drug)
+                if all(not (e[0] == kind and e[1] == d) for e in out):
+                    out.append(ev)
+                break   # first date after this trigger is the one
+    return out
+
+
+def db_save_fda_event(ticker, kind, date_obj, drug="", source="", link=""):
+    try:
+        conn = db_connect()
+        conn.execute("""
+            INSERT OR IGNORE INTO fda_events (ticker,event_date,kind,drug,source,link,found_at)
+            VALUES (?,?,?,?,?,?,?)
+        """, (ticker.upper(), date_obj.isoformat(), kind, drug or "", source or "", link or "",
+              datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        LOGGER.warning(f"db_save_fda_event failed: {e}")
+
+
+def db_delete_fda_event(ticker, event_date, kind):
+    try:
+        conn = db_connect()
+        conn.execute("DELETE FROM fda_events WHERE ticker=? AND event_date=? AND kind=?",
+                     (ticker, event_date, kind))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        LOGGER.warning(f"db_delete_fda_event failed: {e}")
+
+
+def db_load_fda_events(days_back=3, days_ahead=550):
+    """Upcoming (and just-passed) FDA events, soonest first."""
+    out = []
+    try:
+        today = datetime.now(ET_ZONE).date()
+        lo = (today - timedelta(days=days_back)).isoformat()
+        hi = (today + timedelta(days=days_ahead)).isoformat()
+        conn = db_connect()
+        conn.row_factory = sqlite3.Row
+        for r in conn.execute("""SELECT * FROM fda_events WHERE event_date BETWEEN ? AND ?
+                                 ORDER BY event_date ASC, ticker ASC""", (lo, hi)):
+            out.append(dict(r))
+        conn.close()
+    except Exception as e:
+        LOGGER.warning(f"db_load_fda_events failed: {e}")
+    return out
+
+
+def fda_events_by_ticker(events):
+    """ticker -> soonest event dict (with 'days_until')."""
+    today = datetime.now(ET_ZONE).date()
+    by = {}
+    for ev in events:
+        try:
+            d = datetime.fromisoformat(ev["event_date"]).date()
+        except Exception:
+            continue
+        ev = dict(ev)
+        ev["days_until"] = (d - today).days
+        cur = by.get(ev["ticker"])
+        if cur is None or abs(ev["days_until"]) < abs(cur["days_until"]):
+            by[ev["ticker"]] = ev
+    return by
+
+
+FDA_ALERT_WINDOW_DAYS = 14   # flag / watch tickers with a decision this soon
+
+def tag_story_fda(story, fda_by):
+    """Attach the soonest nearby FDA event (if any) to a story + add a warning
+    to both bull and short views."""
+    for t in story.get("tickers", [])[:3]:
+        ev = fda_by.get(t)
+        if not ev or not (-3 <= ev["days_until"] <= FDA_ALERT_WINDOW_DAYS):
+            continue
+        story["fda_event"] = ev
+        when = ("TODAY" if ev["days_until"] == 0 else
+                f"in {ev['days_until']} day(s)" if ev["days_until"] > 0 else
+                f"{-ev['days_until']} day(s) ago")
+        drug = f" ({ev['drug']})" if ev.get("drug") else ""
+        msg = (f"${t} has an FDA {'decision' if ev['kind'] == 'PDUFA' else 'advisory panel'}"
+               f"{drug} {when} — {ev['event_date']}. Binary event: biotech stocks often move 50%+ either way")
+        for mode in ("bull", "short"):
+            res = story.get(mode)
+            if res is not None and msg not in res.setdefault("warnings", []):
+                res["warnings"] = list(res["warnings"]) + [msg]
+        break
+
+def fda_badge_text(ev):
+    d = ev["days_until"]
+    kind = "FDA" if ev["kind"] == "PDUFA" else "AdCom"
+    if d > 1:  return f"💊 {kind} in {d}d"
+    if d == 1: return f"💊 {kind} TOMORROW"
+    if d == 0: return f"💊 {kind} TODAY"
+    return f"💊 {kind} {-d}d ago"
 
 # ───────────────────────────── AUTO-UPDATER ───────────────────────────────────
 
@@ -3301,7 +3637,7 @@ def generate_trader_analysis(story, price_data=None):
 
 def fetch_feed(url):
     req = Request(url, headers={
-        "User-Agent": USER_AGENT,
+        "User-Agent": SEC_USER_AGENT if "sec.gov" in url else USER_AGENT,
         "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.8",
     })
     with urlopen(req, timeout=HTTP_TIMEOUT) as resp:
@@ -3364,25 +3700,78 @@ def parse_feed(content, source):
         })
     return stories
 
-def fetch_all_feeds(progress_cb=None):
+# ─── SEC 8-K item decoding ────────────────────────────────────────────────────
+# EDGAR's "latest filings" feed only says things like "8-K - Acme Inc (Filer)"
+# plus item numbers. These are translated into plain words so the bull/short
+# keyword scoring can understand what the filing is about.
+SEC_8K_ITEM_HINTS = {
+    "1.01": "enters into material agreement",
+    "1.02": "terminates agreement (material contract ended)",
+    "1.03": "bankruptcy or receivership",
+    "1.05": "material cybersecurity incident",
+    "2.02": "results of operations (earnings release)",
+    "2.05": "restructuring / exit costs, layoffs",
+    "2.06": "material impairment",
+    "3.01": "delisting notice (failure to satisfy continued listing rule)",
+    "3.02": "private placement — unregistered sale of equity (dilution)",
+    "4.01": "change in auditor",
+    "4.02": "restatement of financial results — previously issued financials should no longer be relied upon",
+    "5.02": "officer / director departure or appointment",
+}
+
+def enrich_sec_filing(story):
+    """Add plain-English meaning of the 8-K item numbers to the summary."""
+    text = f"{story.get('title','')} {story.get('summary','')}"
+    items = re.findall(r"\bItem\s+(\d\.\d{2})", text, re.IGNORECASE)
+    hints = []
+    for it in items:
+        h = SEC_8K_ITEM_HINTS.get(it)
+        if h and h not in hints:
+            hints.append(h)
+    if hints:
+        story = dict(story)
+        story["summary"] = (story.get("summary", "") + "  |  SEC 8-K: " + "; ".join(hints))[:1800]
+        story["sec_items"] = sorted(set(items))
+    return story
+
+_FEED_CACHE = {}   # url -> (fetched_at_ts, [stories])
+
+def fetch_all_feeds(progress_cb=None, force=False):
+    """Fetch every feed. Fast sources (wires, SEC) are re-downloaded every call;
+    slow sources reuse their cached items for up to 5 minutes so 60-second
+    refreshes don't hammer sites (and get you rate-limited). force=True
+    re-downloads everything (manual refresh)."""
     all_stories = []
     total = sum(len(v) for v in RSS_FEEDS.values())
     done = 0
+    now_ts = datetime.now(timezone.utc).timestamp()
     for source, urls in RSS_FEEDS.items():
+        min_age = FAST_FEED_MIN_SEC if source in FAST_FEED_SOURCES else SLOW_FEED_MIN_SEC
         for url in urls:
             done += 1
+            cached = _FEED_CACHE.get(url)
+            if not force and cached and (now_ts - cached[0]) < min_age:
+                all_stories.extend(dict(st) for st in cached[1])
+                continue
             if progress_cb:
                 try: progress_cb(done, total, source)
                 except Exception: pass
             try:
                 raw = fetch_feed(url)
                 stories = parse_feed(raw, source)
+                if source == "SEC EDGAR":
+                    stories = [enrich_sec_filing(st) for st in stories]
+                _FEED_CACHE[url] = (now_ts, [dict(st) for st in stories])
                 all_stories.extend(stories)
                 LOGGER.info(f"Fetched {len(stories)} from {source}")
             except (HTTPError, URLError) as e:
                 LOGGER.warning(f"Network error for {source} {url}: {e}")
+                if cached:   # keep showing the last good copy
+                    all_stories.extend(dict(st) for st in cached[1])
             except Exception as e:
                 LOGGER.warning(f"Unexpected error for {source} {url}: {e}")
+                if cached:
+                    all_stories.extend(dict(st) for st in cached[1])
     return all_stories
 
 def dedupe_stories(stories):
@@ -4019,7 +4408,7 @@ class StoryDetailPanel(tk.Frame):
 
                 # ─── EVENT CHAIN — chronological price chain around the news drop ───
                 if event_chain:
-                    tk.Label(body, text="PRICE CHAIN  (anchored on news drop)",
+                    tk.Label(body, text="PRICE CHAIN  (oldest → newest)",
                              bg=PALETTE["panel"], fg=PALETTE["text_mute"],
                              font=(FONT_DISPLAY, 8, "bold"), anchor="w"
                              ).pack(fill="x", pady=(4, 4))
@@ -4061,10 +4450,16 @@ class StoryDetailPanel(tk.Frame):
         """Render one event in the news-anchored price chain.
         Events are stacked vertically with a connecting line between them."""
         is_news = evt["kind"] == "news_drop"
+        is_move = evt["kind"] == "move_start"
         is_emphasis = evt.get("emphasized", False)
 
-        # Color: news = warning yellow; emphasized = accent; otherwise muted
-        if is_news:
+        # Color: news = warning yellow; real move = red/green; emphasized = accent
+        if is_move:
+            up = (evt.get("move_pct_window") or 0) >= 0
+            bg_color = PALETTE["accent_2"] if up else PALETTE["danger"]
+            fg_color = "#0a0e1c"
+            label_fg = "#0a0e1c"
+        elif is_news:
             bg_color = PALETTE["warn"]
             fg_color = "#0a0e1c"
             label_fg = "#0a0e1c"
@@ -4083,7 +4478,7 @@ class StoryDetailPanel(tk.Frame):
         # Time column
         time_str = evt["time_et"].strftime("%a %b %d  %I:%M %p ET")
         tk.Label(row, text=time_str, bg=bg_color,
-                 fg=label_fg if is_news else PALETTE["text_mute"],
+                 fg=label_fg if (is_news or is_move) else PALETTE["text_mute"],
                  font=(FONT_DISPLAY, 9), width=23, anchor="w"
                  ).pack(side="left", padx=(8, 0), pady=6)
 
@@ -4091,9 +4486,11 @@ class StoryDetailPanel(tk.Frame):
         label_text = evt["label"]
         if is_news:
             label_text = f"⚡ {label_text}"
+        elif is_move:
+            label_text = f"🚨 {label_text}"
         tk.Label(row, text=label_text, bg=bg_color,
                  fg=label_fg,
-                 font=(FONT_DISPLAY, 10, "bold" if is_emphasis or is_news else "normal"),
+                 font=(FONT_DISPLAY, 10, "bold" if is_emphasis or is_news or is_move else "normal"),
                  width=22, anchor="w"
                  ).pack(side="left", pady=6)
 
@@ -4108,13 +4505,28 @@ class StoryDetailPanel(tk.Frame):
         if evt.get("pct_from_baseline") is not None:
             pct = evt["pct_from_baseline"]
             pct_color = PALETTE["accent_2"] if pct >= 0 else PALETTE["danger"]
-            if is_news:
+            if is_news or is_move:
                 pct_color = "#0a0e1c"
             sign = "+" if pct >= 0 else ""
             tk.Label(row, text=f"   ({sign}{pct:.2f}% from prior close)",
                      bg=bg_color, fg=pct_color,
                      font=(FONT_DISPLAY, 9, "bold")
                      ).pack(side="left", pady=6)
+
+        # Extra context lines under the row
+        notes = []
+        if is_move:
+            notes.append("This is most likely when the news really hit the market "
+                         "(faster sources than RSS).")
+        if evt.get("lag_note"):
+            notes.append(f"Scanner saw it {evt['lag_note']}.")
+        if evt.get("note"):
+            notes.append(f"Note: {evt['note']}.")
+        for n_text in notes:
+            tk.Label(parent, text=f"      ↳ {n_text}", bg=PALETTE["panel"],
+                     fg=PALETTE["text_dim"], font=(FONT_DISPLAY, 8, "italic"),
+                     anchor="w", justify="left", wraplength=680
+                     ).pack(fill="x")
 
     def _render_session_bar(self, parent, sess):
         """Render one session as a horizontal block: pre-market / regular / after-hours."""
@@ -4520,6 +4932,12 @@ class StoryCard(tk.Frame):
 
         # Soft warnings (reverse split, premium issues, etc.) — don't change
         # the score but flag them next to the catalysts so the user is informed.
+        if s.get("fda_event"):
+            tk.Label(bot, text=f" {fda_badge_text(s['fda_event'])} ",
+                     bg="#a855f7", fg="#0a0e1c",
+                     font=(FONT_DISPLAY, 8, "bold")
+                     ).pack(side="left", padx=(0, 5))
+
         if s.get("warnings"):
             tk.Label(bot, text=f" ⚠️ {len(s['warnings'])}  ",
                      bg=PALETTE["warn"], fg="#0a0e1c",
@@ -4706,6 +5124,11 @@ class PreMarketScanner(tk.Tk):
         self.min_score = tk.IntVar(value=20)
         self.show_only_watchlist = tk.BooleanVar(value=False)
         self.auto_refresh = tk.BooleanVar(value=True)
+        self.spike_alarm = tk.BooleanVar(value=True)
+        self.spike_queue = queue.Queue()
+        self._spike_thread = None
+        self._spike_cooldown = {}        # (ticker, kind/dir) -> ts of last alert
+        self._fda_events_cache = {}
         self.fetch_thread = None
         self.fetch_queue = queue.Queue()
         self.next_refresh_at = None
@@ -4716,6 +5139,11 @@ class PreMarketScanner(tk.Tk):
         self._build_ui()
         self._schedule_refresh(initial=True)
         self._tick_clock()
+        self.after(5000, self._spike_cycle)
+        # Load known FDA dates right away (the alarm watches those tickers)
+        threading.Thread(target=lambda: setattr(
+            self, "_fda_events_cache", fda_events_by_ticker(db_load_fda_events())),
+            daemon=True).start()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Check for updates on launch (non-blocking, won't notify unless update found)
@@ -4746,6 +5174,7 @@ class PreMarketScanner(tk.Tk):
             self.min_score.set(self._mode_min_scores[self.scan_mode])
             self.show_only_watchlist.set(bool(data.get("only_watchlist", False)))
             self.auto_refresh.set(bool(data.get("auto_refresh", True)))
+            self.spike_alarm.set(bool(data.get("spike_alarm", True)))
         except Exception as e:
             LOGGER.warning(f"Failed to load settings: {e}")
 
@@ -4766,6 +5195,7 @@ class PreMarketScanner(tk.Tk):
                     "scan_mode": self.scan_mode,
                     "only_watchlist": bool(self.show_only_watchlist.get()),
                     "auto_refresh": bool(self.auto_refresh.get()),
+                    "spike_alarm": bool(self.spike_alarm.get()),
                 }, f, indent=2)
         except Exception as e:
             LOGGER.warning(f"Failed to save settings: {e}")
@@ -4815,6 +5245,13 @@ class PreMarketScanner(tk.Tk):
         tk.Label(footer, text=f"  Logging: {LOG_FILE}",
                  bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
                  font=(FONT_DISPLAY, 8)).pack(side="left", padx=12, pady=6)
+        # Updater lives in the footer (keeps the sidebar short enough to fit)
+        self.update_btn = tk.Button(footer, text="⤓  CHECK FOR UPDATES",
+            bg=PALETTE["bg_alt"], fg=PALETTE["accent"],
+            font=(FONT_DISPLAY, 8, "bold"), bd=0, relief="flat",
+            activebackground=PALETTE["panel_hover"], cursor="hand2",
+            command=self._manual_update_check, padx=8, pady=0)
+        self.update_btn.pack(side="right", padx=(0, 10))
         tk.Label(footer, text=f"v{APP_VERSION}  ·  ",
                  bg=PALETTE["bg_alt"], fg=PALETTE["text_mute"],
                  font=(FONT_DISPLAY, 8)).pack(side="right", padx=0, pady=6)
@@ -4851,12 +5288,20 @@ class PreMarketScanner(tk.Tk):
             command=self._manual_refresh, padx=10, pady=12)
         self.refresh_btn.pack(fill="x", padx=18, pady=(10, 8))
 
-        tk.Checkbutton(side, text="Auto-refresh every 5 min (pre-market)",
+        tk.Checkbutton(side, text="Auto-refresh (every 1–2 min)",
             variable=self.auto_refresh, bg=PALETTE["bg_alt"],
             fg=PALETTE["text_dim"], selectcolor=PALETTE["panel"],
             activebackground=PALETTE["bg_alt"], activeforeground=PALETTE["text"],
             font=(FONT_DISPLAY, 8), anchor="w",
             command=self._on_auto_refresh_toggle
+            ).pack(fill="x", padx=18, pady=(0, 2))
+
+        tk.Checkbutton(side, text=f"🚨 Price-spike alarm (±{SPIKE_PCT:.0f}% moves)",
+            variable=self.spike_alarm, bg=PALETTE["bg_alt"],
+            fg=PALETTE["text_dim"], selectcolor=PALETTE["panel"],
+            activebackground=PALETTE["bg_alt"], activeforeground=PALETTE["text"],
+            font=(FONT_DISPLAY, 8), anchor="w",
+            command=self._save_settings
             ).pack(fill="x", padx=18, pady=(0, 8))
 
         # Watchlist
@@ -4917,14 +5362,6 @@ class PreMarketScanner(tk.Tk):
         self.cat_frame.pack(fill="both", expand=True, padx=18, pady=(0, 10))
         self._build_category_list()
 
-        # Updater section
-        self._section_header(side, "APP UPDATES")
-        self.update_btn = tk.Button(side, text="⤓  CHECK FOR UPDATES",
-            bg=PALETTE["panel"], fg=PALETTE["accent"],
-            font=(FONT_DISPLAY, 9, "bold"), bd=0, relief="flat",
-            activebackground=PALETTE["panel_hover"], cursor="hand2",
-            command=self._manual_update_check, padx=10, pady=8)
-        self.update_btn.pack(fill="x", padx=18, pady=(0, 16))
 
     def _build_category_list(self):
         """(Re)build the category checkboxes for the active scan mode."""
@@ -4940,10 +5377,10 @@ class PreMarketScanner(tk.Tk):
             var = tk.BooleanVar(value=cat in active)
             self.category_vars[cat] = var
             row = tk.Frame(cat_frame, bg=PALETTE["bg_alt"])
-            row.pack(fill="x", anchor="w", pady=1)
+            row.pack(fill="x", anchor="w", pady=0)
             swatch = tk.Frame(row, bg=CATEGORY_COLORS.get(cat, PALETTE["accent"]),
                               width=10, height=14)
-            swatch.pack(side="left", padx=(0, 8), pady=2)
+            swatch.pack(side="left", padx=(0, 8), pady=1)
             swatch.pack_propagate(False)
             tk.Checkbutton(row, text=cat, variable=var,
                 bg=PALETTE["bg_alt"], fg=PALETTE["text"],
@@ -4968,9 +5405,13 @@ class PreMarketScanner(tk.Tk):
         main.pack(side="right", fill="both", expand=True)
         self._results_main = main
 
+        # Price-spike alert banners (empty until an alarm fires)
+        self.alert_bar = tk.Frame(main, bg=PALETTE["bg"])
+        self.alert_bar.pack(fill="x", padx=24, pady=(10, 0))
+
         # Tabs row
         top = tk.Frame(main, bg=PALETTE["bg"])
-        top.pack(fill="x", padx=24, pady=(18, 0))
+        top.pack(fill="x", padx=24, pady=(8, 0))
 
         self.view_mode = tk.StringVar(value="live")
 
@@ -4989,6 +5430,14 @@ class PreMarketScanner(tk.Tk):
             command=lambda: self._set_view("watchlist"),
             padx=14, pady=8)
         self.tab_watchlist_btn.pack(side="left", padx=(0, 4))
+
+        self.tab_fda_btn = tk.Button(top, text="💊  FDA CALENDAR",
+            bg=PALETTE["panel"], fg=PALETTE["text_dim"],
+            font=(FONT_DISPLAY, 11, "bold"), bd=0, relief="flat",
+            cursor="hand2", activebackground=PALETTE["panel_hover"],
+            command=lambda: self._set_view("fda"),
+            padx=14, pady=8)
+        self.tab_fda_btn.pack(side="left", padx=(0, 4))
 
         self.view_hint = tk.Label(top, text="   Click any story for details · pin stories you want to track",
                  bg=PALETTE["bg"], fg=PALETTE["text_mute"],
@@ -5084,11 +5533,14 @@ class PreMarketScanner(tk.Tk):
         only_watch = self.show_only_watchlist.get()
         cats = self.active_short_categories if self.scan_mode == "short" else self.active_categories
         view = self.view_mode.get() if hasattr(self, "view_mode") else "live"
+        if view == "fda":
+            if not getattr(self, "_soft_refresh", False):
+                self._render_fda_calendar()
+            return
 
         # Make every story show the active mode's score/catalysts/etc.
         for s in self.stories:
-            if s.get("mode") != self.scan_mode:
-                project_story_mode(s, self.scan_mode)
+            project_story_mode(s, self.scan_mode)
 
         filtered = []
         for s in self.stories:
@@ -5125,6 +5577,13 @@ class PreMarketScanner(tk.Tk):
                 -(x["published"].timestamp() if x.get("published") else 0),
             ))
         self.filtered = filtered
+        sig = (view, self.scan_mode, tuple(
+            (x.get("story_key", ""), x.get("score"), bool(x.get("watch_match")),
+             x.get("story_key", "") in self.pinned_stories)
+            for x in filtered[:MAX_STORIES]))
+        if getattr(self, "_soft_refresh", False) and sig == getattr(self, "_last_render_sig", None):
+            return   # background refresh changed nothing visible — keep scroll position
+        self._last_render_sig = sig
         self._render_cards()
 
     def _render_cards(self):
@@ -5166,6 +5625,123 @@ class PreMarketScanner(tk.Tk):
         self.count_lbl.config(
             text=f"Showing {len(self.filtered)} {view_label}  "
         )
+        self.canvas.yview_moveto(0)
+
+    # ─────────── FDA calendar view ───────────
+    def _render_fda_calendar(self):
+        for child in self.cards_frame.winfo_children():
+            child.destroy()
+        self._rendered_cards = []
+        events = db_load_fda_events()
+        today = datetime.now(ET_ZONE).date()
+
+        # Add-by-hand row
+        add = tk.Frame(self.cards_frame, bg=PALETTE["panel"])
+        add.pack(fill="x", padx=6, pady=(4, 8))
+        tk.Label(add, text="  ➕ Add a date:", bg=PALETTE["panel"], fg=PALETTE["text_dim"],
+                 font=(FONT_DISPLAY, 9, "bold")).pack(side="left", pady=10)
+        tk.Label(add, text="  Ticker", bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                 font=(FONT_DISPLAY, 8)).pack(side="left")
+        t_entry = tk.Entry(add, width=8, bg=PALETTE["panel_alt"], fg=PALETTE["text"],
+                           insertbackground=PALETTE["text"], relief="flat", font=(FONT_DISPLAY, 10))
+        t_entry.pack(side="left", padx=(4, 8), ipady=4)
+        tk.Label(add, text="Date (YYYY-MM-DD)", bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                 font=(FONT_DISPLAY, 8)).pack(side="left")
+        d_entry = tk.Entry(add, width=11, bg=PALETTE["panel_alt"], fg=PALETTE["text"],
+                           insertbackground=PALETTE["text"], relief="flat", font=(FONT_DISPLAY, 10))
+        d_entry.pack(side="left", padx=(4, 8), ipady=4)
+        tk.Label(add, text="Drug", bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                 font=(FONT_DISPLAY, 8)).pack(side="left")
+        g_entry = tk.Entry(add, width=12, bg=PALETTE["panel_alt"], fg=PALETTE["text"],
+                           insertbackground=PALETTE["text"], relief="flat", font=(FONT_DISPLAY, 10))
+        g_entry.pack(side="left", padx=(4, 8), ipady=4)
+        err = tk.Label(add, text="", bg=PALETTE["panel"], fg=PALETTE["danger"], font=(FONT_DISPLAY, 8))
+
+        def do_add(_e=None):
+            tkr = t_entry.get().strip().upper().lstrip("$")
+            try:
+                d = datetime.strptime(d_entry.get().strip(), "%Y-%m-%d").date()
+            except ValueError:
+                err.config(text="Date must look like 2026-12-05")
+                return
+            if not re.fullmatch(r"[A-Z]{1,6}", tkr):
+                err.config(text="Ticker looks wrong")
+                return
+            db_save_fda_event(tkr, "PDUFA", d, g_entry.get().strip()[:40], source="Added by you")
+            LOGGER.info(f"FDA date added by user: {tkr} {d}")
+            self._fda_events_cache = fda_events_by_ticker(db_load_fda_events())
+            self._render_fda_calendar()
+
+        tk.Button(add, text="Add", bg=PALETTE["accent"], fg="#0a0e1c",
+                  font=(FONT_DISPLAY, 9, "bold"), bd=0, relief="flat", cursor="hand2",
+                  command=do_add, padx=10, pady=3).pack(side="left", padx=(0, 8))
+        err.pack(side="left")
+        d_entry.bind("<Return>", do_add)
+
+        if not events:
+            tk.Label(self.cards_frame,
+                text="\n No FDA dates found yet.\n\n"
+                     " BullScan saves any \"PDUFA date\" or \"advisory committee\" date it sees in\n"
+                     " the news, so this list fills up over time. You can also add dates by hand\n"
+                     " (free lists: benzinga.com/fda-calendar, biopharmawatch.com/fda-calendar).\n",
+                bg=PALETTE["bg"], fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 10),
+                justify="left").pack(pady=20, padx=10, anchor="w")
+            self.count_lbl.config(text="0 FDA dates  ")
+            self.canvas.yview_moveto(0)
+            return
+
+        for ev in events:
+            d = datetime.fromisoformat(ev["event_date"]).date()
+            days = (d - today).days
+            if days < 0:
+                badge, bcol = f"{-days}d ago", PALETTE["text_mute"]
+            elif days == 0:
+                badge, bcol = "TODAY", PALETTE["danger"]
+            elif days <= 3:
+                badge, bcol = f"in {days}d", PALETTE["danger"]
+            elif days <= FDA_ALERT_WINDOW_DAYS:
+                badge, bcol = f"in {days}d", PALETTE["warn"]
+            else:
+                badge, bcol = f"in {days}d", PALETTE["accent_2"]
+            row = tk.Frame(self.cards_frame, bg=PALETTE["panel"], highlightthickness=1,
+                           highlightbackground=PALETTE["border_soft"])
+            row.pack(fill="x", padx=6, pady=2)
+            tk.Label(row, text=f" {badge} ", bg=bcol, fg="#0a0e1c", width=9,
+                     font=(FONT_DISPLAY, 9, "bold")).pack(side="left", fill="y")
+            tk.Label(row, text=d.strftime("  %a %b %d, %Y"), bg=PALETTE["panel"], fg=PALETTE["text"],
+                     font=(FONT_DISPLAY, 10, "bold"), width=19, anchor="w").pack(side="left", pady=8)
+            tk.Label(row, text=f" ${ev['ticker']} ", bg=PALETTE["highlight"], fg=PALETTE["text"],
+                     font=(FONT_DISPLAY, 10, "bold")).pack(side="left", padx=(4, 8))
+            kind_txt = "FDA decision" if ev["kind"] == "PDUFA" else "Advisory panel"
+            tk.Label(row, text=kind_txt + (f" · {ev['drug']}" if ev.get("drug") else ""),
+                     bg=PALETTE["panel"], fg=PALETTE["accent_hi"],
+                     font=(FONT_DISPLAY, 9, "bold"), anchor="w").pack(side="left")
+            src = ev.get("source") or ""
+            src_lbl = tk.Label(row, text=f"   {src[:70]}{'…' if len(src) > 70 else ''}",
+                     bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                     font=(FONT_DISPLAY, 8, "italic"), anchor="w",
+                     cursor="hand2" if ev.get("link") else "")
+            src_lbl.pack(side="left", fill="x", expand=True)
+            if ev.get("link"):
+                src_lbl.bind("<Button-1>", lambda e, u=ev["link"]: webbrowser.open(u))
+            tk.Button(row, text="✕", bg=PALETTE["panel"], fg=PALETTE["text_mute"],
+                      font=(FONT_DISPLAY, 9), bd=0, relief="flat", cursor="hand2",
+                      command=lambda e=ev: (db_delete_fda_event(e["ticker"], e["event_date"], e["kind"]),
+                                            self._render_fda_calendar())
+                      ).pack(side="right", padx=6)
+            tk.Button(row, text="Chart", bg=PALETTE["panel_alt"], fg=PALETTE["accent"],
+                      font=(FONT_DISPLAY, 8, "bold"), bd=0, relief="flat", cursor="hand2",
+                      command=lambda t=ev["ticker"]: webbrowser.open(
+                          f"https://www.tradingview.com/chart/?symbol={quote_plus(t)}"),
+                      padx=8, pady=2).pack(side="right", padx=(0, 4))
+
+        tk.Label(self.cards_frame,
+            text=f"\n Tickers with a decision in the next {FDA_ALERT_WINDOW_DAYS} days are watched by the "
+                 "price-spike alarm automatically.\n Dates come from company press releases and can change — "
+                 "the FDA can also act early.",
+            bg=PALETTE["bg"], fg=PALETTE["text_mute"], font=(FONT_DISPLAY, 8, "italic"),
+            justify="left").pack(anchor="w", padx=10, pady=(6, 10))
+        self.count_lbl.config(text=f"{len(events)} FDA dates  ")
         self.canvas.yview_moveto(0)
 
     def _pin_story_tickers(self, story):
@@ -5222,15 +5798,136 @@ class PreMarketScanner(tk.Tk):
     def _set_view(self, mode):
         """Switch between 'live' and 'watchlist' views."""
         self.view_mode.set(mode)
-        if mode == "live":
-            self.tab_live_btn.config(bg=PALETTE["accent"], fg="#0a0e1c")
-            self.tab_watchlist_btn.config(bg=PALETTE["panel"], fg=PALETTE["text_dim"])
-            self.view_hint.config(text="   Click any story for details · pin stories you want to track")
-        else:
-            self.tab_live_btn.config(bg=PALETTE["panel"], fg=PALETTE["text_dim"])
-            self.tab_watchlist_btn.config(bg=PALETTE["accent"], fg="#0a0e1c")
-            self.view_hint.config(text="   Stories you've pinned + tickers you're tracking. Click a story for outcome details.")
+        tabs = {"live": self.tab_live_btn, "watchlist": self.tab_watchlist_btn,
+                "fda": self.tab_fda_btn}
+        for name, btn in tabs.items():
+            if name == mode:
+                btn.config(bg=PALETTE["accent"], fg="#0a0e1c")
+            else:
+                btn.config(bg=PALETTE["panel"], fg=PALETTE["text_dim"])
+        hints = {
+            "live": "   Click any story for details · pin stories you want to track",
+            "watchlist": "   Stories you've pinned + tickers you're tracking. Click a story for outcome details.",
+            "fda": "   Upcoming FDA decisions found in news + ones you add",
+        }
+        self.view_hint.config(text=hints.get(mode, ""))
+        self._last_render_sig = None
         self._apply_filters()
+
+    # ─────────── Price-spike alarm ───────────
+    def _spike_targets(self):
+        """Tickers to watch: watchlist, pinned stories, FDA decisions coming up,
+        then tickers from the strongest current stories. Capped."""
+        out = []
+        def add(t):
+            if t and t not in out:
+                out.append(t)
+        for t in sorted(self.watchlist):
+            add(t)
+        for st in self.stories:
+            if st.get("story_key") in self.pinned_stories:
+                for t in st.get("tickers", [])[:2]:
+                    add(t)
+        for t, ev in sorted(self._fda_events_cache.items(), key=lambda kv: kv[1]["days_until"]):
+            if -1 <= ev["days_until"] <= FDA_ALERT_WINDOW_DAYS:
+                add(t)
+        strong = sorted(
+            self.stories,
+            key=lambda st: -max(st.get("bull", {}).get("score", 0), st.get("short", {}).get("score", 0)))
+        for st in strong:
+            if max(st.get("bull", {}).get("score", 0), st.get("short", {}).get("score", 0)) < 50:
+                break
+            for t in st.get("tickers", [])[:1]:
+                add(t)
+        return out[:SPIKE_MAX_TICKERS]
+
+    def _spike_cycle(self):
+        """Runs every 60s on the main thread; does the network work on a thread."""
+        self.after(60_000, self._spike_cycle)
+        if not self.spike_alarm.get() or market_session_now() == "closed":
+            return
+        if self._spike_thread and self._spike_thread.is_alive():
+            return
+        targets = self._spike_targets()
+        if not targets:
+            return
+        cooldown = self._spike_cooldown
+        out_q = self.spike_queue
+
+        def worker():
+            now = datetime.now(timezone.utc).timestamp()
+            today = datetime.now(ET_ZONE).strftime("%Y-%m-%d")
+            for t in targets:
+                data = fetch_live_bars(t)
+                if data:
+                    alert = detect_spike(data["bars"], data.get("prev_close"))
+                    if alert:
+                        if alert["kind"] == "day":
+                            key = (t, "day", today)          # once per day
+                            ok = key not in cooldown
+                        else:
+                            key = (t, "up" if alert["pct"] > 0 else "down")
+                            ok = now - cooldown.get(key, 0) > SPIKE_COOLDOWN_SEC
+                        if ok:
+                            cooldown[key] = now
+                            out_q.put((t, alert))
+                time.sleep(0.25)   # be gentle with Yahoo
+
+        self._spike_thread = threading.Thread(target=worker, daemon=True)
+        self._spike_thread.start()
+
+    def _show_spike_alert(self, ticker, alert):
+        up = alert["pct"] > 0
+        color = PALETTE["accent_2"] if up else PALETTE["danger"]
+        when = datetime.fromtimestamp(alert["ts"], ET_ZONE).strftime("%I:%M %p")
+        if alert["kind"] == "sudden":
+            mins = max(1, int((alert["ts"] - (alert["from_ts"] or alert["ts"])) / 60))
+            what = f"{alert['pct']:+.1f}% in {mins} min"
+        else:
+            what = f"{alert['pct']:+.1f}% on the day"
+        extra = []
+        ev = self._fda_events_cache.get(ticker)
+        if ev and -3 <= ev["days_until"] <= FDA_ALERT_WINDOW_DAYS:
+            extra.append(fda_badge_text(ev))
+        news = [st for st in self.stories if ticker in st.get("tickers", [])]
+        extra.append("news in feed" if news else "no news in feeds yet")
+        text = (f"🚨  ${ticker}  {what}   (${alert['from_price']:.2f} → ${alert['to_price']:.2f})"
+                f"  ·  {when} ET  ·  " + "  ·  ".join(extra))
+        LOGGER.info(f"SPIKE | {ticker} | {what} | {alert['from_price']:.2f}->{alert['to_price']:.2f} | {', '.join(extra)}")
+
+        kids = [w for w in self.alert_bar.winfo_children() if w.winfo_manager()]
+        row = tk.Frame(self.alert_bar, bg=color)
+        if kids:
+            row.pack(fill="x", pady=(0, 3), before=kids[0])
+        else:
+            row.pack(fill="x", pady=(0, 3))
+        tk.Label(row, text=text, bg=color, fg="#0a0e1c",
+                 font=(FONT_DISPLAY, 10, "bold"), anchor="w").pack(side="left", padx=10, pady=6)
+        tk.Button(row, text="✕", bg=color, fg="#0a0e1c", bd=0, relief="flat", cursor="hand2",
+                  font=(FONT_DISPLAY, 10, "bold"), command=row.destroy).pack(side="right", padx=6)
+        tk.Button(row, text="Watch", bg="#0a0e1c", fg=PALETTE["text"], bd=0, relief="flat",
+                  cursor="hand2", font=(FONT_DISPLAY, 8, "bold"), padx=8,
+                  command=lambda: self._add_to_watchlist(ticker)).pack(side="right", padx=(0, 4))
+        tk.Button(row, text="Chart", bg="#0a0e1c", fg=PALETTE["text"], bd=0, relief="flat",
+                  cursor="hand2", font=(FONT_DISPLAY, 8, "bold"), padx=8,
+                  command=lambda: webbrowser.open(
+                      f"https://www.tradingview.com/chart/?symbol={quote_plus(ticker)}")
+                  ).pack(side="right", padx=(0, 4))
+        # Keep at most 4 banners
+        for old in self.alert_bar.winfo_children()[4:]:
+            old.destroy()
+        try:
+            self.bell()
+        except Exception:
+            pass
+
+    def _add_to_watchlist(self, ticker):
+        self.watchlist.add(ticker)
+        self.watch_entry.delete(0, tk.END)
+        self.watch_entry.insert(0, ", ".join(sorted(self.watchlist)))
+        self._rescore_watch_matches()
+        self._apply_filters()
+        self._save_settings()
 
     # ─────────── Bull / Short mode ───────────
     def _style_mode_buttons(self):
@@ -5337,6 +6034,10 @@ class PreMarketScanner(tk.Tk):
     def _start_fetch(self):
         if self.fetch_thread and self.fetch_thread.is_alive():
             return
+        # Manual / first refresh re-downloads every feed; auto refreshes reuse
+        # cached slow feeds (see fetch_all_feeds).
+        self._force_fetch = not getattr(self, "_auto_fetch", False)
+        self._auto_fetch = False
         self.refresh_btn.config(state="disabled", text="Fetching…")
         self.status_lbl.config(text="Fetching feeds…", fg=PALETTE["warn"])
         self.fetch_thread = threading.Thread(target=self._fetch_worker, daemon=True)
@@ -5347,7 +6048,8 @@ class PreMarketScanner(tk.Tk):
         try:
             def prog(done, total, source):
                 self.fetch_queue.put(("progress", (done, total, source)))
-            stories = fetch_all_feeds(progress_cb=prog)
+            stories = fetch_all_feeds(progress_cb=prog,
+                                      force=getattr(self, "_force_fetch", True))
             stories = dedupe_stories(stories)
 
             # Capture pinned story keys at the start of this fetch so the worker
@@ -5378,6 +6080,12 @@ class PreMarketScanner(tk.Tk):
                 s["watch_match"] = bool(self.watchlist & set(s["tickers"]))
                 s["story_key"] = re.sub(r"[^a-z0-9]+", "", s["title"].lower())[:120]
                 s["pinned"] = s["story_key"] in pinned_keys_snapshot
+
+                # ─── FDA calendar: harvest any PDUFA / AdCom dates mentioned ───
+                if s["tickers"]:
+                    for kind, d, drug in extract_fda_events(f"{s['title']}\n{s.get('summary', '')}"):
+                        db_save_fda_event(s["tickers"][0], kind, d, drug,
+                                          source=s["title"][:200], link=s.get("link", ""))
 
                 # ─── Score BOTH ways (bull + short) in one pass ───
                 modes = score_story_both_ways(s)
@@ -5437,6 +6145,12 @@ class PreMarketScanner(tk.Tk):
                                 q = fetch_quote(t)
                                 if q:
                                     db_save_snapshot(story_id, t, q, "headline")
+
+            # ─── Tag stories whose ticker has an FDA decision coming up ───
+            fda_by = fda_events_by_ticker(db_load_fda_events())
+            self._fda_events_cache = fda_by
+            for s in stories:
+                tag_story_fda(s, fda_by)
 
             # ─── Drop non-tradeable stories ───
             # If none of our 5 ticker-detection strategies found a public,
@@ -5537,6 +6251,7 @@ class PreMarketScanner(tk.Tk):
                 attach_confidence(p, p_short, "short")
                 p["bull"] = p_bull
                 p["short"] = p_short
+                tag_story_fda(p, fda_by)
                 project_story_mode(p, "bull")
                 stories.append(p)
 
@@ -5586,7 +6301,11 @@ class PreMarketScanner(tk.Tk):
                 f"{s['source']} | {s['title']} | {s.get('link', '')}"
             )
 
-        self._apply_filters()
+        self._soft_refresh = True
+        try:
+            self._apply_filters()
+        finally:
+            self._soft_refresh = False
 
         now_str = datetime.now(ET_ZONE).strftime("%I:%M:%S %p ET")
         self.status_lbl.config(
@@ -5614,28 +6333,32 @@ class PreMarketScanner(tk.Tk):
             self.next_refresh_at = None
             return
 
-        if not is_premarket_now():
+        interval = refresh_interval_for(market_session_now())
+        if not interval:
+            # Overnight / weekend: idle, re-check every minute for the next session
             self._refresh_job = self.after(60_000, self._schedule_refresh)
             self.next_refresh_at = None
             return
 
-        self.next_refresh_at = datetime.now(timezone.utc) + timedelta(seconds=REFRESH_INTERVAL_SEC)
-        self._refresh_job = self.after(REFRESH_INTERVAL_SEC * 1000, self._auto_refresh_tick)
+        self.next_refresh_at = datetime.now(timezone.utc) + timedelta(seconds=interval)
+        self._refresh_job = self.after(interval * 1000, self._auto_refresh_tick)
 
     def _auto_refresh_tick(self):
         if not self.auto_refresh.get():
             self._schedule_refresh()
             return
-        if not is_premarket_now():
+        if not refresh_interval_for(market_session_now()):
             self._schedule_refresh()
             return
+        self._auto_fetch = True
         self._start_fetch()
 
     def _tick_clock(self):
         now_et = datetime.now(ET_ZONE)
-        is_pm = is_premarket_now()
-        marker = "● PRE-MARKET" if is_pm else "○ off-hours"
-        marker_color = PALETTE["accent_2"] if is_pm else PALETTE["text_mute"]
+        session = market_session_now()
+        marker = {"premarket": "● PRE-MARKET", "regular": "● MARKET OPEN",
+                  "afterhours": "● AFTER-HOURS"}.get(session, "○ market closed")
+        marker_color = PALETTE["text_mute"] if session == "closed" else PALETTE["accent_2"]
         self.clock_lbl.config(text=now_et.strftime("%I:%M:%S %p ET"))
 
         cur = self.status_lbl.cget("text")
@@ -5646,6 +6369,12 @@ class PreMarketScanner(tk.Tk):
                 if secs > 0:
                     extra = f"  ·  next refresh in {secs // 60}m {secs % 60:02d}s"
             self.status_lbl.config(text=f"{marker}{extra}", fg=marker_color)
+        try:
+            while True:
+                tkr, alert = self.spike_queue.get_nowait()
+                self._show_spike_alert(tkr, alert)
+        except queue.Empty:
+            pass
         self.after(1000, self._tick_clock)
 
     def _on_close(self):
